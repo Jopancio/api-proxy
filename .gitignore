@@ -3,3 +3,6 @@ node_modules/
 *.log
 data/users.json
 data/users.json.tmp
+data/users.json.bak
+data/models.json
+data/settings.json
