@@ -1,8 +1,19 @@
+# Dependencies
 node_modules/
+
+# Local secrets and environment overrides
 .env
+.env.*
+!.env.example
+
+# Runtime state (user accounts, balances, model cache, settings, and locks)
+data/
+
+# Generated logs
 *.log
-data/users.json
-data/users.json.tmp
-data/users.json.bak
-data/models.json
-data/settings.json
+
+# Local agent and editor configuration
+.kiro/
+AGENTS.md
+.vscode/
+.idea/
