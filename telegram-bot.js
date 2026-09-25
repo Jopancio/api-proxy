@@ -47,6 +47,14 @@ function escapeHtml(value) {
   }[character]));
 }
 
+function formatTokens(value) {
+  return Number(value || 0).toLocaleString('id-ID');
+}
+
+function formatCost(value) {
+  return `Rp${Number(value || 0).toLocaleString('id-ID', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
 function menuKeyboard(userId = '') {
   const rows = [
     [{ text: '\u{1F4CA} API Dashboard', callback_data: 'dashboard' }, { text: '\u{1F4B3} Top up', callback_data: 'top_up' }],
@@ -309,7 +317,11 @@ async function handleCallbackQuery(query) {
     const lines = logs.map((entry) => {
       const model = entry.model ? ` model=${entry.model}` : '';
       const user = entry.userId ? ` user=${entry.userId}` : ' anonymous';
-      return `${entry.at} ${entry.method} ${entry.path} → ${entry.status}${model}${user}`;
+      const tokens = ` in=${Number(entry.inputTokens || 0)} out=${Number(entry.outputTokens || 0)} total=${Number(entry.totalTokens || 0)}`;
+      const cost = ` cost=Rp${Number(entry.cost || 0).toLocaleString('id-ID', { maximumFractionDigits: 4 })}`;
+      const balance = entry.balanceAfter === undefined ? '' : ` balance=Rp${Number(entry.balanceAfter || 0).toLocaleString('id-ID', { maximumFractionDigits: 2 })}`;
+      const rate = entry.pricePerMillion ? ` rate=Rp${Number(entry.pricePerMillion).toLocaleString('id-ID')}/1M` : '';
+      return `${entry.at} ${entry.method} ${entry.path} → ${entry.status}${model}${user}${tokens}${rate}${cost}${balance}`;
     });
     const logText = lines.join('\n').slice(-3500);
     const text = lines.length
@@ -397,8 +409,20 @@ async function handleCallbackQuery(query) {
   if (action === 'logs') {
     const user = getUser(userId);
     const logs = user?.logs || [];
-    const lines = logs.slice(-10).reverse().map((entry) => `${escapeHtml(entry.at)} — ${escapeHtml(entry.endpoint)} (${entry.status})`);
-    const text = lines.length ? `\u{1F9FE} <b>Recent API Logs</b>\n\n${lines.join('\n')}` : '\u{1F9FE} <b>Recent API Logs</b>\n\nNo API usage yet. \u{1F4ED}';
+    const lines = logs.slice(-10).reverse().map((entry, index) => {
+      const input = Number(entry.inputTokens || 0);
+      const output = Number(entry.outputTokens || 0);
+      const total = input + output;
+      return [
+        `<b>#${index + 1} ${entry.status >= 400 ? '❌' : '✅'} ${escapeHtml(entry.endpoint)}</b>`,
+        `🕒 ${escapeHtml(entry.at)}`,
+        `🤖 Model: <code>${escapeHtml(entry.model || 'unknown')}</code>`,
+        `📥 Input: <b>${formatTokens(input)}</b>  •  📤 Output: <b>${formatTokens(output)}</b>`,
+        `🔢 Total: <b>${formatTokens(total)}</b>  •  💰 Tarif: <b>Rp${formatTokens(entry.pricePerMillion)}/1M</b>`,
+        `💳 Biaya: <b>${formatCost(entry.cost)}</b>`,
+      ].join('\n');
+    });
+    const text = lines.length ? `\u{1F9FE} <b>Recent API Logs</b>\n\n${lines.join('\n\n')}` : '\u{1F9FE} <b>Recent API Logs</b>\n\nNo API usage yet. \u{1F4ED}';
     return telegram('sendMessage', { chat_id: chatId, text, parse_mode: 'HTML', reply_markup: dashboardKeyboard() });
   }
 

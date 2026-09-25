@@ -58,6 +58,7 @@ app.post('/webhooks/cashi', express.raw({ type: 'application/json' }), (req, res
 app.use('/v1', (req, res, next) => {
   const startedAt = Date.now();
   res.on('finish', () => {
+    const usage = req.usageDetails || {};
     recordAdminRequest({
       method: req.method,
       path: req.originalUrl,
@@ -65,6 +66,12 @@ app.use('/v1', (req, res, next) => {
       durationMs: Date.now() - startedAt,
       userId: req.userRecord?.telegramId || null,
       model: req.body?.model || req.requestModel || null,
+      inputTokens: usage.inputTokens || 0,
+      outputTokens: usage.outputTokens || 0,
+      totalTokens: usage.totalTokens || 0,
+      pricePerMillion: usage.pricePerMillion || 0,
+      cost: usage.cost || 0,
+      balanceAfter: usage.balanceAfter,
     });
   });
   next();
@@ -207,13 +214,22 @@ app.use(
           } catch (_) {
             // Streaming responses and non-JSON errors are still counted as requests.
           }
+          const inputTokens = usage.prompt_tokens ?? usage.input_tokens ?? 0;
+          const outputTokens = usage.completion_tokens ?? usage.output_tokens ?? 0;
+          const billingModel = model || req.requestModel;
+          const pricePerMillion = require('./pricing').getBillingPrice(billingModel);
+          const totalTokens = Number(inputTokens) + Number(outputTokens);
+          const cost = pricePerMillion ? (totalTokens / 1_000_000) * pricePerMillion : 0;
+          req.usageDetails = { inputTokens, outputTokens, totalTokens, pricePerMillion, cost };
           recordUsage(req.userApiKey, {
             endpoint: req.originalUrl,
             statusCode: proxyRes.statusCode,
-            model: model || req.requestModel,
-            inputTokens: usage.prompt_tokens ?? usage.input_tokens ?? 0,
-            outputTokens: usage.completion_tokens ?? usage.output_tokens ?? 0,
+            model: billingModel,
+            inputTokens,
+            outputTokens,
           });
+          const updatedUser = require('./usage-db').findUserByApiKey(req.userApiKey);
+          req.usageDetails.balanceAfter = updatedUser?.balance;
         });
       },
       error: (err, req, res) => {
