@@ -37,6 +37,16 @@ const MODEL_PRICES = Object.freeze({
   'qwen-3.8-flash': 350,
   'qwen-3.8-max': 400,
   'qwen-3.8-max-0902': 400,
+  'claude': 400,
+});
+// Models that are always listed even when the upstream /models response omits
+// them (it intermittently returns a partial list). display name -> upstream route.
+const PINNED_MODELS = Object.freeze({
+  'deepseek-v4-pro-0813': '1/deepseek-v4-pro-0813',
+  'deepseek-v4-pro': '1/deepseek-v4-pro',
+  'deepseek-v4-flash': '1/deepseek-v4-flash',
+  'deepseek-v4-flash-0731': '1/deepseek-v4-flash-0731',
+  'claude': '1/claude',
 });
 const { isAllModelsFree } = require('./admin-settings');
 const DEFAULT_MODEL_PRICE = Number(process.env.DEFAULT_MODEL_PRICE || 400);
@@ -60,11 +70,14 @@ function getModelFamily(model) {
   if (name.startsWith('kimi-')) return 'Kimi';
   if (name.startsWith('gemini-')) return 'Gemini';
   if (name.startsWith('minimax-')) return 'MiniMax';
+  if (name === 'claude' || name.startsWith('claude-')) return 'Claude';
   return null;
 }
 
+// Display name of a model: drops any upstream route prefix ("1/", "cx/", "cbcn/" or
+// any new one the upstream adds), i.e. everything up to the last "/".
 function stripModelPrefix(model) {
-  return String(model || '').replace(/^(?:1|cx)\//i, '');
+  return String(model || '').replace(/^.*\//, '');
 }
 
 function getModelPrice(model) {
@@ -85,4 +98,4 @@ function tokenAllowance(price, balance = 10000) {
   return (Number(balance) * 1_000_000) / price;
 }
 
-module.exports = { MODEL_PRICES, DEFAULT_MODEL_PRICE, MODEL_PRICE_MARKUP, getModelFamily, stripModelPrefix, getModelPrice, getBillingPrice, tokenAllowance };
+module.exports = { MODEL_PRICES, PINNED_MODELS, DEFAULT_MODEL_PRICE, MODEL_PRICE_MARKUP, getModelFamily, stripModelPrefix, getModelPrice, getBillingPrice, tokenAllowance };

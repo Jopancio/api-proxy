@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="referrer" content="no-referrer">
+  <title>Admin Stats</title>
+  <!-- Telegram Mini App SDK: provides the signed launch data (initData) and the theme colors. -->
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    /* Fallback palette for when Telegram supplies no theme. */
+    :root {
+      --fb-page: #f1f2f6; --fb-card: #ffffff; --fb-text: #1c1d21; --fb-hint: #5f636b;
+      --fb-accent: #2481cc; --fb-accent-text: #ffffff; --fb-danger: #c62828; --fb-ok: #1f7a46;
+      --fb-sep: rgba(110, 115, 125, 0.25);
+    }
+    :root[data-scheme="dark"] {
+      --fb-page: #0f1115; --fb-card: #1b1e24; --fb-text: #eceef2; --fb-hint: #a3a8b2;
+      --fb-accent: #5aa7e6; --fb-accent-text: #0f1115; --fb-danger: #ff7a7a; --fb-ok: #5fd38d;
+      --fb-sep: rgba(160, 165, 175, 0.25);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-scheme="light"]) {
+        --fb-page: #0f1115; --fb-card: #1b1e24; --fb-text: #eceef2; --fb-hint: #a3a8b2;
+        --fb-accent: #5aa7e6; --fb-accent-text: #0f1115; --fb-danger: #ff7a7a; --fb-ok: #5fd38d;
+        --fb-sep: rgba(160, 165, 175, 0.25);
+      }
+    }
+    /* Telegram's theme variables win when present. */
+    :root {
+      color-scheme: light dark;
+      --page: var(--tg-theme-secondary-bg-color, var(--fb-page));
+      --card: var(--tg-theme-section-bg-color, var(--tg-theme-bg-color, var(--fb-card)));
+      --text: var(--tg-theme-text-color, var(--fb-text));
+      --hint: var(--tg-theme-hint-color, var(--fb-hint));
+      --heading: var(--tg-theme-section-header-text-color, var(--hint));
+      --accent: var(--tg-theme-button-color, var(--fb-accent));
+      --accent-text: var(--tg-theme-button-text-color, var(--fb-accent-text));
+      --danger: var(--tg-theme-destructive-text-color, var(--fb-danger));
+      --sep: var(--tg-theme-section-separator-color, var(--fb-sep));
+      --ok: var(--fb-ok);
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; }
+    body {
+      background: var(--page);
+      color: var(--text);
+      font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      padding: 12px 12px calc(16px + env(safe-area-inset-bottom));
+    }
+    header, .status, main, footer { max-width: 760px; margin-left: auto; margin-right: auto; }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+    h1 { font-size: 20px; margin: 0; overflow-wrap: anywhere; }
+    .subtitle { margin: 2px 0 0; color: var(--hint); font-size: 13px; }
+    button {
+      font: inherit; font-weight: 600; min-height: 40px; padding: 8px 14px; border: 0; border-radius: 10px;
+      background: var(--accent); color: var(--accent-text); cursor: pointer; flex-shrink: 0;
+    }
+    button:disabled { opacity: 0.6; cursor: progress; }
+    button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
+    .status { margin-top: 0; margin-bottom: 12px; color: var(--hint); font-size: 13px; padding: 0 2px; }
+    .status.error { color: var(--danger); font-weight: 600; }
+    .tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-bottom: 12px; }
+    .tile { background: var(--card); color: var(--text); border-radius: 14px; padding: 10px 12px; }
+    .tile .label { display: block; font-size: 12px; color: var(--hint); }
+    .tile .value { display: block; font-size: 20px; font-weight: 700; overflow-wrap: anywhere; }
+    .card { background: var(--card); color: var(--text); border-radius: 14px; padding: 12px 14px; margin-bottom: 12px; }
+    h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--heading); margin: 0 0 6px; }
+    h3 { font-size: 14px; margin: 12px 0 4px; }
+    dl.rows { margin: 0; }
+    .row { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 7px 0; border-top: 1px solid var(--sep); }
+    .row:first-child { border-top: 0; }
+    .row dt { margin: 0; }
+    .row dd { margin: 0; font-weight: 600; text-align: right; overflow-wrap: anywhere; }
+    .bar { height: 8px; border-radius: 999px; background: var(--sep); overflow: hidden; margin: 3px 0 6px; }
+    .bar-fill { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
+    .badge { display: inline-block; padding: 0 8px; border: 1px solid currentColor; border-radius: 999px; font-size: 13px; font-weight: 600; }
+    .badge.on { color: var(--ok); }
+    .badge.off { color: var(--danger); }
+    .badge.neutral { color: var(--hint); }
+    .list { list-style: none; margin: 0; padding: 0; }
+    .list > li { padding: 8px 0; border-top: 1px solid var(--sep); }
+    .list > li:first-child { border-top: 0; }
+    .item-title { font-weight: 600; overflow-wrap: anywhere; }
+    .meta { color: var(--hint); font-size: 13px; margin-top: 2px; overflow-wrap: anywhere; }
+    .chips { display: flex; flex-wrap: wrap; gap: 2px 12px; font-size: 13px; margin-top: 3px; }
+    .option { margin-top: 6px; }
+    .option-label { display: flex; justify-content: space-between; gap: 12px; font-size: 14px; }
+    .option-label span:first-child { overflow-wrap: anywhere; }
+    .option-label span:last-child { flex-shrink: 0; font-weight: 600; }
+    .quote { white-space: pre-wrap; overflow-wrap: anywhere; margin: 4px 0 0; padding-left: 10px; border-left: 3px solid var(--sep); }
+    .empty { color: var(--hint); margin: 0; }
+    footer { color: var(--hint); font-size: 12px; text-align: center; margin-top: 4px; margin-bottom: 8px; }
+    @media (min-width: 640px) {
+      .tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1 id="title">Admin Stats</h1>
+      <p id="subtitle" class="subtitle">Admin only</p>
+    </div>
+    <button type="button" id="refresh"><span aria-hidden="true">&#x21bb;</span> Refresh</button>
+  </header>
+  <p id="status" class="status" role="status" aria-live="polite">Loading&hellip;</p>
+  <main id="content" hidden></main>
+  <noscript><p class="status error">This Mini App needs JavaScript.</p></noscript>
+  <script>
+  (function () {
+    'use strict';
+
+    // Every number on this page comes from GET <page>/stats. The server only answers after it has
+    // verified Telegram's signature on initData and that the signed user is the admin; this page
+    // checks nothing itself and holds no data until then.
+    var tg = window.Telegram && window.Telegram.WebApp;
+    var statusEl = document.getElementById('status');
+    var contentEl = document.getElementById('content');
+    var refreshButton = document.getElementById('refresh');
+    var titleEl = document.getElementById('title');
+    var subtitleEl = document.getElementById('subtitle');
+    // Page at .../admin/app, data at .../admin/app/stats (also behind a reverse-proxy path prefix).
+    var STATS_URL = window.location.pathname.replace(/\/+$/, '') + '/stats';
+    var LOCALE = 'id-ID';
+    var ZONE = 'Asia/Jakarta';
+
+    function applyScheme() {
+      if (tg && tg.colorScheme) document.documentElement.setAttribute('data-scheme', tg.colorScheme);
+    }
+    if (tg) {
+      if (typeof tg.ready === 'function') tg.ready();
+      if (typeof tg.expand === 'function') tg.expand();
+      applyScheme();
+      if (typeof tg.onEvent === 'function') tg.onEvent('themeChanged', applyScheme);
+    }
+    var initData = tg && typeof tg.initData === 'string' ? tg.initData : '';
+
+    // ---------- formatting (same conventions as the bot's Admin Dashboard) ----------
+    function num(value) { return Number(value || 0).toLocaleString(LOCALE); }
+    function rupiah(value) { return 'Rp' + Math.round(Number(value || 0)).toLocaleString(LOCALE); }
+    function cost(value) {
+      return 'Rp' + Number(value || 0).toLocaleString(LOCALE, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    }
+    function short(value) {
+      var n = Number(value || 0);
+      var units = [[1e12, 'T'], [1e9, 'M'], [1e6, 'jt'], [1e3, 'rb']];
+      for (var i = 0; i < units.length; i += 1) {
+        if (Math.abs(n) >= units[i][0]) return (n / units[i][0]).toLocaleString(LOCALE, { maximumFractionDigits: 1 }) + ' ' + units[i][1];
+      }
+      return n.toLocaleString(LOCALE);
+    }
+    function big(value) { return Math.abs(Number(value || 0)) >= 1e6 ? num(value) + ' (' + short(value) + ')' : num(value); }
+    function wib(iso) {
+      var date = new Date(iso || NaN);
+      if (!iso || isNaN(date.getTime())) return '-';
+      return date.toLocaleString(LOCALE, { timeZone: ZONE, dateStyle: 'medium', timeStyle: 'short' }) + ' WIB';
+    }
+    function duration(ms) {
+      var minutes = Math.max(0, Math.round(ms / 60000));
+      var parts = [];
+      if (minutes >= 1440) parts.push(Math.floor(minutes / 1440) + 'd');
+      if (minutes % 1440 >= 60) parts.push(Math.floor((minutes % 1440) / 60) + 'h');
+      if (minutes % 60 || !parts.length) parts.push((minutes % 60) + 'm');
+      return parts.slice(0, 2).join(' ');
+    }
+    function personName(user) {
+      var name = user.firstName || (user.username ? '@' + user.username : 'ID ' + user.telegramId);
+      return user.firstName && user.username ? name + ' (@' + user.username + ')' : name;
+    }
+    function joinOrNone(list) { return Array.isArray(list) && list.length ? list.join(', ') : 'None'; }
+
+    // ---------- DOM building: values always become text nodes, never HTML ----------
+    function append(node, children) {
+      for (var i = 0; i < children.length; i += 1) {
+        var child = children[i];
+        if (child === undefined || child === null || child === false || child === '') continue;
+        if (Array.isArray(child)) append(node, child);
+        else node.appendChild(typeof child === 'object' ? child : document.createTextNode(String(child)));
+      }
+      return node;
+    }
+    function h(tag, attrs) {
+      var node = document.createElement(tag);
+      var keys = attrs ? Object.keys(attrs) : [];
+      for (var i = 0; i < keys.length; i += 1) {
+        var value = attrs[keys[i]];
+        if (value === undefined || value === null || value === false) continue;
+        if (keys[i] === 'class') node.className = value;
+        else node.setAttribute(keys[i], String(value));
+      }
+      return append(node, Array.prototype.slice.call(arguments, 2));
+    }
+    function card(id, icon, title) {
+      return h('section', { class: 'card', 'aria-labelledby': 'sec-' + id },
+        h('h2', { id: 'sec-' + id }, h('span', { 'aria-hidden': 'true' }, icon), ' ', title),
+        Array.prototype.slice.call(arguments, 3));
+    }
+    function rows(pairs) {
+      return h('dl', { class: 'rows' }, pairs.filter(Boolean).map(function (pair) {
+        return h('div', { class: 'row' }, h('dt', null, pair[0]), h('dd', null, pair[1]));
+      }));
+    }
+    function tile(label, value) {
+      return h('div', { class: 'tile' }, h('span', { class: 'label' }, label), h('span', { class: 'value' }, value));
+    }
+    function badge(text, kind) { return h('span', { class: 'badge ' + kind }, text); }
+    function onOff(on, onText, offText) { return on ? badge(onText, 'on') : badge(offText, 'off'); }
+    function bar(percent, label) {
+      var value = Math.max(0, Math.min(100, Number(percent) || 0));
+      return h('div', { class: 'bar', role: 'progressbar', 'aria-valuemin': '0', 'aria-valuemax': '100', 'aria-valuenow': String(Math.round(value)), 'aria-label': label },
+        h('span', { class: 'bar-fill', style: 'width:' + value + '%' }));
+    }
+    function empty(text) { return h('p', { class: 'empty' }, text); }
+
+    // Ranked users (top users, top referrers): name, Telegram ID, then the numbers.
+    function ranked(list, details, emptyText) {
+      if (!Array.isArray(list) || !list.length) return empty(emptyText);
+      return h('ol', { class: 'list', role: 'list' }, list.map(function (user, index) {
+        return h('li', null,
+          h('div', { class: 'item-title' }, (index + 1) + '. ' + personName(user)),
+          h('div', { class: 'meta' }, 'ID ' + user.telegramId),
+          h('div', { class: 'chips' }, details(user).map(function (text) { return h('span', null, text); })));
+      }));
+    }
+
+    function rateLimitText(limits) {
+      var models = limits && limits.models ? limits.models : {};
+      var families = limits && limits.families ? limits.families : {};
+      var items = Object.keys(families).map(function (name) { return name + ' (family): ' + num(families[name]) + ' rpm'; })
+        .concat(Object.keys(models).map(function (name) { return name + ': ' + num(models[name]) + ' rpm'; }));
+      return joinOrNone(items);
+    }
+
+    function announcement(settings) {
+      if (!settings.announcement) return rows([['Last announcement', 'None']]);
+      return h('div', null,
+        h('h3', null, 'Last announcement'),
+        settings.announcementAt ? h('div', { class: 'meta' }, wib(settings.announcementAt)) : null,
+        h('p', { class: 'quote' }, settings.announcement));
+    }
+
+    function bansosList(list) {
+      if (!Array.isArray(list) || !list.length) return empty('No active or scheduled BANSOS.');
+      var now = Date.now();
+      return h('ul', { class: 'list', role: 'list' }, list.map(function (entry) {
+        var targets = (entry.families || []).map(function (family) { return family + ' (family)'; }).concat(entry.models || []);
+        var active = entry.status === 'active';
+        return h('li', null,
+          h('div', { class: 'item-title' }, '#' + entry.id + ' ', active ? badge('Active', 'on') : badge('Scheduled', 'neutral')),
+          h('div', null, joinOrNone(targets)),
+          h('div', { class: 'meta' }, active
+            ? 'Until ' + wib(entry.endsAt) + ' (' + duration(Date.parse(entry.endsAt) - now) + ' left)'
+            : wib(entry.startsAt) + ' \u2192 ' + wib(entry.endsAt)));
+      }));
+    }
+
+    // Open polls, then the 3 most recently closed ones (like the bot's poll screen).
+    function pollList(polls) {
+      if (!Array.isArray(polls) || !polls.length) return empty('No polls yet.');
+      var shown = polls.filter(function (poll) { return poll.status === 'open'; })
+        .concat(polls.filter(function (poll) { return poll.status !== 'open'; }).slice(0, 3));
+      return h('ul', { class: 'list', role: 'list' }, shown.map(function (poll) {
+        var total = Number(poll.total || 0);
+        return h('li', null,
+          h('div', { class: 'item-title' }, '#' + poll.id + ' ' + poll.question + ' ', poll.status === 'open' ? badge('Open', 'on') : badge('Closed', 'neutral')),
+          h('div', { class: 'meta' }, num(total) + ' vote(s) \u00b7 sent to ' + num(poll.sent) + ' user(s) \u00b7 ' + wib(poll.createdAt)),
+          (poll.options || []).map(function (option, index) {
+            var count = Number((poll.counts || [])[index] || 0);
+            var percent = total ? Math.round((count / total) * 100) : 0;
+            return h('div', { class: 'option' },
+              h('div', { class: 'option-label' }, h('span', null, option), h('span', null, percent + '% (' + num(count) + ')')),
+              bar(percent, option + ': ' + percent + '%'));
+          }));
+      }));
+    }
+
+    function render(d) {
+      var store = d.storeName || 'Store';
+      var summary = d.summary || {};
+      var users = d.users || {};
+      var requests = d.requests || {};
+      var last24h = requests.last24h || {};
+      var tokens = d.tokens || {};
+      var finance = d.finance || {};
+      var paid = finance.paidTopups || {};
+      var redeemed = finance.redeemed || {};
+      var codes = d.redeemCodes || {};
+      var referral = d.referral || {};
+      var tickets = d.tickets || {};
+      var settings = d.settings || {};
+      var successRate = Number(requests.successRate || 0);
+
+      document.title = store + ' \u00b7 Admin Stats';
+      titleEl.textContent = store + ' Stats';
+      subtitleEl.textContent = 'Admin only \u00b7 amounts in IDR \u00b7 times in WIB';
+
+      contentEl.textContent = '';
+      append(contentEl, [
+        h('div', { class: 'tiles' },
+          tile('Users', num(summary.users)),
+          tile('Requests', short(summary.requests)),
+          tile('Paid top-ups', rupiah(summary.paidTopups)),
+          tile('Open tickets', num(summary.openTickets))),
+        card('users', '\u{1F465}', 'Users', rows([
+          ['Total', num(users.total) + ' (+' + num(users.new24h) + ' in 24h)'],
+          ['Active (made a request)', num(users.active)],
+          ['Active API keys', num(users.activeApiKeys)],
+        ])),
+        card('requests', '\u{1F4E1}', 'Requests', rows([
+          ['Total', num(requests.total)],
+          ['\u2705 Success', num(requests.success)],
+          ['\u274C Errors', num(requests.errors)],
+          ['Success rate', successRate.toFixed(1) + '%'],
+        ]), bar(successRate, 'Success rate ' + successRate.toFixed(1) + '%'), rows([
+          ['Last 24h', num(last24h.requests) + ' req \u00b7 ' + num(last24h.errors) + ' err'],
+          ['Avg response (24h)', num(last24h.avgMs) + ' ms'],
+        ])),
+        card('tokens', '\u{1F522}', 'Tokens', rows([
+          ['\u{1F4E5} Input', big(tokens.input)],
+          ['\u{1F4E4} Output', big(tokens.output)],
+          ['\u{1F9EE} Total', big(tokens.total)],
+        ])),
+        card('finance', '\u{1F4B0}', 'Finance', rows([
+          ['Usage billed', cost(finance.usageBilled)],
+          ['Paid top-ups', rupiah(paid.amount) + ' (' + num(paid.settledOrders) + ' settled \u00b7 ' + num(paid.pendingOrders) + ' pending)'],
+          ['Redeemed codes', rupiah(redeemed.amount) + ' (' + num(redeemed.count) + '\u00d7)'],
+          ['Users\u2019 total balance', rupiah(finance.usersTotalBalance)],
+        ])),
+        card('top-users', '\u{1F3C6}', 'Top users (by tokens)', ranked(d.topUsers, function (user) {
+          return [big(user.totalTokens) + ' tokens', num(user.requests) + ' req', num(user.errors) + ' err',
+            'spent ' + cost(user.spent), 'balance ' + rupiah(user.balance), 'bonus ' + big(user.bonusTokens)];
+        }, 'No usage yet.')),
+        card('codes', '\u{1F39F}\u{FE0F}', 'Redeem codes', rows([
+          ['Created', num(codes.created)],
+          ['Still active', num(codes.active)],
+        ])),
+        card('referral', '\u{1F91D}', 'Referral', rows([
+          ['Status', onOff(referral.enabled, 'ON', 'OFF')],
+          ['Reward per invite', big(referral.rewardTokens) + ' tokens'],
+          ['Max rewarded invites / user', referral.maxRewardsPerUser ? num(referral.maxRewardsPerUser) : 'Unlimited'],
+          ['Invites', num(referral.invites) + ' (rewarded ' + num(referral.rewarded) + ')'],
+          ['Tokens awarded', big(referral.tokensAwarded)],
+          ['Unused bonus tokens', big(referral.bonusTokensLeft)],
+          ['Bonus tokens used', big(referral.bonusTokensUsed)],
+        ]), h('h3', null, 'Top referrers'), ranked(referral.topReferrers, function (user) {
+          return [num(user.invites) + ' invites', num(user.rewarded) + ' rewarded', big(user.tokensEarned) + ' tokens earned', big(user.bonusTokensLeft) + ' bonus left'];
+        }, 'No referrals yet.')),
+        card('tickets', '\u{1F3AB}', 'Tickets', rows([
+          ['Open', num(tickets.open)],
+          ['Closed', num(tickets.closed)],
+          ['Total', num(tickets.total)],
+        ])),
+        card('settings', '\u2699\u{FE0F}', 'Settings', rows([
+          ['Free mode', onOff(settings.freeMode, 'ON', 'OFF')],
+          ['Payments (top up)', onOff(settings.paymentsEnabled, 'OPEN', 'CLOSED')],
+          ['Disabled families', joinOrNone(settings.disabledFamilies)],
+          ['Disabled models', joinOrNone(settings.disabledModels)],
+          ['Rate limits', rateLimitText(settings.rateLimits)],
+        ]), announcement(settings)),
+        card('bansos', '\u{1F381}', 'BANSOS (free models)', bansosList(d.bansos)),
+        card('polls', '\u{1F4CA}', 'Polls', pollList(d.polls)),
+        h('footer', null,
+          d.statsSince ? 'Stats since ' + wib(d.statsSince) + ' (last reset)' : 'Stats counted since the beginning',
+          h('br'),
+          'Updated ' + wib(d.generatedAt)),
+      ]);
+      contentEl.hidden = false;
+    }
+
+    function setStatus(text, isError) {
+      statusEl.textContent = text;
+      statusEl.className = isError ? 'status error' : 'status';
+    }
+
+    var loading = false;
+    function load() {
+      if (loading) return;
+      if (!initData) {
+        setStatus('Open this Mini App from the bot: Admin Panel \u2192 Stats Mini App.', true);
+        refreshButton.hidden = true;
+        return;
+      }
+      loading = true;
+      refreshButton.disabled = true;
+      setStatus(contentEl.hidden ? 'Loading\u2026' : 'Refreshing\u2026', false);
+      fetch(STATS_URL, { headers: { Authorization: 'tma ' + initData }, cache: 'no-store' })
+        .then(function (response) {
+          return response.json().catch(function () { return null; }).then(function (body) {
+            if (!response.ok) {
+              setStatus((body && body.error && body.error.message) || 'Server error (' + response.status + ').', true);
+              // Signed out or not the admin: do not leave earlier numbers on screen.
+              if (response.status === 401 || response.status === 403) {
+                contentEl.textContent = '';
+                contentEl.hidden = true;
+              }
+              return;
+            }
+            render(body);
+            setStatus('Updated ' + wib(body.generatedAt), false);
+          });
+        })
+        .catch(function () {
+          setStatus('Could not reach the server. Check your connection and press Refresh.', true);
+        })
+        .then(function () {
+          loading = false;
+          refreshButton.disabled = false;
+        });
+    }
+
+    refreshButton.addEventListener('click', load);
+    load();
+  })();
+  </script>
+</body>
+</html>

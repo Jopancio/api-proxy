@@ -12,6 +12,9 @@ data/
 # Generated logs
 *.log
 
+# Launcher PID files
+.runtime/
+
 # Local agent and editor configuration
 .kiro/
 AGENTS.md
