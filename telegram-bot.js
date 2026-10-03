@@ -7,6 +7,7 @@ const path = require('path');
 const {
   adjustBalance, ensureUser, setUserLanguage, createApiKey, getAdminLogs, getAllUsers, getUser, getOrder, revokeApiKey, createOrder, settleOrder,
   createRedeemCode, redeemCode, listRedeemCodes, disableRedeemCode, getAdminStats, resetStats,
+  createAccessCode, redeemAccessCode, listAccessCodes, getAccessCode, disableAccessCode, getModelAccess,
   addTicketMessage, closeTicket, countOpenTickets, createTicket, findTicketByAdminMessage, getOpenTicketForUser,
   getTicket, linkAdminMessage, listTickets,
   createPoll, votePoll, getPoll, listPolls, closePoll, setPollSent,
@@ -50,6 +51,11 @@ const pendingAdminReferral = new Map();
 const bansosDrafts = new Map();
 // Admin typing a BANSOS time: 'start' or 'end'.
 const pendingAdminBansos = new Map();
+// Model access code wizard draft per admin: { models: [], kind: 'duration' | 'range', durationMs,
+// expiresAt, startsAt, endsAt }. Survives button presses until it is created or cancelled.
+const accessCodeDrafts = new Map();
+// Admin typing a value for that draft: 'duration', 'expires', 'start' or 'end'.
+const pendingAdminAccess = new Map();
 // Poll announcement wizard: admins whose next message is the poll text, and the parsed
 // draft ({ question, options }) waiting for "Send". The draft survives button presses.
 const pendingAdminPoll = new Set();
@@ -59,6 +65,8 @@ const MAX_REFERRAL_CAP = 100_000;
 // Set from getMe at startup; used to build t.me/<bot>?start=<code> referral links.
 let botUsername = '';
 const REDEEM_CODE_PATTERN = /^RDM-[A-F0-9]{6}-[A-F0-9]{6}$/i;
+// Model access codes (Admin Panel -> Kode Akses Model); same format as usage-db.js.
+const ACCESS_CODE_PATTERN = /^MDL-[A-F0-9]{6}-[A-F0-9]{6}$/i;
 const MAX_REDEEM_AMOUNT = 100_000_000;
 const MAX_REDEEM_USES = 10_000;
 
@@ -77,6 +85,7 @@ function clearPendingInput(userId) {
   pendingAdminRateLimit.delete(id);
   pendingAdminReferral.delete(id);
   pendingAdminBansos.delete(id);
+  pendingAdminAccess.delete(id);
   pendingAdminPoll.delete(id);
 }
 
@@ -282,6 +291,7 @@ async function adminKeyboard() {
     }],
     // Balance & codes
     [{ text: '\u{1F39F}\u{FE0F} Redeem Codes', callback_data: 'admin_redeem' }, { text: '\u{1F4B3} Top Up User', callback_data: 'admin_topup' }],
+    [{ text: '\u{1F510} Kode Akses Model', callback_data: 'admin_mac' }],
     // Settings & broadcast
     [
       { text: await isAllModelsFree() ? '\u{1F534} Disable Free Mode' : '\u{1F7E2} Free Mode', callback_data: 'admin_free_toggle' },
@@ -430,6 +440,9 @@ async function adminPanelMessage() {
     ]),
     card('\u{1F39F}\u{FE0F} <b>Redeem Codes</b>', [
       `Created: <b>${formatTokens(s.redeemCodes)}</b>  \u{2022}  Still active: <b>${formatTokens(s.activeRedeemCodes)}</b>`,
+      // Missing on an API server without model access codes yet.
+      s.accessCodes !== undefined
+        && `\u{1F510} Model access: <b>${formatTokens(s.accessCodes)}</b> created \u{2022} <b>${formatTokens(s.accessCodesAvailable)}</b> unused \u{2022} <b>${formatTokens(s.accessCodesInUse)}</b> running`,
     ]),
     card('\u{1F91D} <b>Referral</b>', [
       `Status: <b>${onOff(referral.enabled)}</b>  \u{2022}  Reward: <b>${shortNumber(referral.rewardTokens)}</b> token/invite`,
@@ -566,6 +579,8 @@ async function statsMessage(telegramId) {
   const keyLines = activeKeys.length
     ? activeKeys.map((entry, index) => `\u{1F511} Key ${index + 1}: <code>${escapeHtml(entry.key)}</code>`)
     : ['\u{1F511} API key: <i>belum ada \u{2014} tekan "Create new API key"</i>'];
+  // An API server without model access codes yet simply has none.
+  const accessCard = modelAccessCard(await getModelAccess(telegramId).catch(() => null), userLanguage(user));
   return [
     '\u{1F4CA} <b>API DASHBOARD</b>',
     DIVIDER,
@@ -577,6 +592,7 @@ async function statsMessage(telegramId) {
       `\u{1F4B0} Saldo: <b>${rupiah(user.balance)}</b>`,
       `\u{1F381} Bonus tokens: <b>${bigNumber(bonusTokens)}</b>${bonusTokens > 0 ? ' <i>(dipakai duluan)</i>' : ''}`,
     ]),
+    ...(accessCard ? [accessCard] : []),
     card('\u{1F4C8} <b>Usage</b>', [
       `\u{1F4E8} Requests: <b>${formatTokens(requests)}</b>  (\u{26A0}\u{FE0F} ${formatTokens(errors)} error)`,
       requests ? `${progressBar(successRate)} <b>${successRate.toFixed(1)}%</b> success` : '',
@@ -626,7 +642,11 @@ function isDisabledIn(disabled, model) {
   return disabled.models.includes(model.toLowerCase()) || disabled.families.includes(getModelFamily(model));
 }
 
-async function modelPriceMessage() {
+// `telegramId` (optional): the asking user, so an active model access code can be pointed out.
+async function modelPriceMessage(telegramId) {
+  const access = telegramId ? await getModelAccess(telegramId).catch(() => null) : null;
+  const account = access?.restricted ? await getUser(telegramId).catch(() => null) : null;
+  const notice = access?.restricted ? `${modelAccessNotice(access, userLanguage(account))}\n\n` : '';
   const disabled = await getDisabledModels();
   // Users only see models they can actually use.
   const models = (await syncSupportedModels()).filter((model) => !isDisabledIn(disabled, model));
@@ -649,7 +669,7 @@ async function modelPriceMessage() {
     });
     return `<b>${family} Family</b>\n${lines.join('\n')}`;
   }).filter(Boolean);
-  return `\u{1F4B0} <b>Model Price</b>\n\n${sections.length ? sections.join('\n\n') : 'No supported models returned by upstream.'}`;
+  return `${notice}\u{1F4B0} <b>Model Price</b>\n\n${sections.length ? sections.join('\n\n') : 'No supported models returned by upstream.'}`;
 }
 
 function revokeKeyboard(user) {
@@ -752,7 +772,14 @@ const REDEEM_FAILURES = {
   used_up: '\u{231B} This code has reached its usage limit.',
 };
 
+// Same normalization as usage-db.js normalizeRedeemCode.
+function normalizeCodeInput(text) {
+  return String(text || '').trim().toUpperCase().replace(/\s+/g, '');
+}
+
 async function performUserRedeem(chatId, from, rawCode) {
+  // One Redeem Code entry for both kinds: MDL-... codes unlock models, RDM-... codes add balance.
+  if (ACCESS_CODE_PATTERN.test(normalizeCodeInput(rawCode))) return performAccessRedeem(chatId, from, rawCode);
   const result = await redeemCode(from.id, rawCode, { firstName: from.first_name, username: from.username });
   if (!result.ok) {
     return telegram('sendMessage', {
@@ -1593,6 +1620,682 @@ async function handleBansosTimeInput(chatId, userId, text) {
   return telegram('sendMessage', { chat_id: chatId, text: view.text, parse_mode: 'HTML', reply_markup: view.reply_markup });
 }
 
+// ---------- Model access codes ----------
+// Admin Panel -> Kode Akses Model. The admin picks one or more models and a period; the API server
+// stores a unique, single-use code (MDL-XXXXXX-XXXXXX). The user who redeems it (Redeem Code or
+// /redeem) may use ONLY those models while the period runs: server.js checks every request and
+// lifts the limit by itself once the period is over. Prices, balance, BANSOS, disabled models and
+// rate limits work as before. The API server checks the admin id again when a code is created or
+// disabled, so these buttons are not the only gate. Model names, codes and user names always go
+// through escapeHtml before they are put into an HTML message.
+
+// [button label, minutes]
+const ACCESS_DURATIONS = [
+  ['1 jam', 60], ['6 jam', 360], ['1 hari', 1440],
+  ['3 hari', 4320], ['7 hari', 10080], ['14 hari', 20160],
+  ['30 hari', 43200], ['60 hari', 86400], ['90 hari', 129600],
+];
+// Same limits as usage-db.js, which checks them again.
+const ACCESS_MIN_PERIOD_MS = 60_000;
+const ACCESS_MAX_PERIOD_MS = 365 * 24 * 60 * 60 * 1000;
+const ACCESS_MAX_AHEAD_MS = 365 * 24 * 60 * 60 * 1000;
+const ACCESS_DEFAULT_REDEEM_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+const ACCESS_MAX_MODELS = 50;
+const ACCESS_CODES_SHOWN = 10;
+const ACCESS_INPUT_FIELDS = ['duration', 'expires', 'start', 'end'];
+const ACCESS_STATUS_LABELS = {
+  available: '\u{1F7E2} belum dipakai',
+  in_use: '\u{1F535} sedang dipakai',
+  scheduled: '\u{23F3} menunggu mulai',
+  finished: '\u{2705} selesai',
+  expired: '\u{231B} kedaluwarsa',
+  disabled: '\u{1F6AB} dinonaktifkan',
+  revoked: '\u{1F6D1} dihentikan admin',
+};
+
+// 90_060_000 -> "1 day 1 hour" (English counterpart of durationText).
+function durationTextEn(ms) {
+  const minutes = Math.max(0, Math.round(Number(ms) / 60_000));
+  const days = Math.floor(minutes / 1440);
+  const hours = Math.floor((minutes % 1440) / 60);
+  const rest = minutes % 60;
+  const unit = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
+  const parts = [];
+  if (days) parts.push(unit(days, 'day'));
+  if (hours) parts.push(unit(hours, 'hour'));
+  if (rest && !days) parts.push(unit(rest, 'minute'));
+  return parts.join(' ') || '< 1 minute';
+}
+
+// What users read about model access codes, in their bot language.
+const ACCESS_USER_TEXT = {
+  id: {
+    failures: {
+      not_found: '\u{274C} Kode tidak ditemukan. Periksa kembali kodenya lalu coba lagi.',
+      already_redeemed: '\u{26A0}\u{FE0F} Kamu sudah menukarkan kode ini.',
+      used: '\u{26D4} Kode ini sudah dipakai. Setiap kode akses model hanya bisa ditukar satu kali.',
+      disabled: '\u{1F6AB} Kode ini sudah dinonaktifkan oleh admin.',
+      expired: '\u{231B} Kode ini sudah kedaluwarsa: batas penukaran atau periode aksesnya sudah lewat.',
+      error: '\u{274C} Kode belum bisa ditukar saat ini. Coba lagi nanti.',
+    },
+    title: '\u{1F389} <b>Kode akses model berhasil ditukar!</b>',
+    code: 'Kode',
+    models: 'Model',
+    period: 'Berlaku',
+    scheduled: (start) => `\u{23F3} Akses dimulai <b>${start}</b>. Sampai saat itu akses model kamu masih normal.`,
+    combined: 'Bersama kode akses lain yang masih aktif, model yang bisa kamu pakai sekarang',
+    rule: '\u{26A0}\u{FE0F} Selama periode ini API key kamu <b>hanya bisa memakai model di atas</b>; model lain akan ditolak. Setelah periode berakhir, akses model kembali normal otomatis.',
+    billing: '\u{1F4B3} Pemakaian tetap memotong saldo / bonus token sesuai harga model.',
+    tryAnother: '\u{1F501} Coba kode lain',
+    back: '\u{1F519} Kembali ke menu',
+    cardTitle: '\u{1F510} <b>Kode Akses Model</b>',
+    cardOnly: 'Hanya model ini yang bisa dipakai',
+    cardUntil: 'sampai',
+    cardStarts: 'mulai',
+    notice: (models, until) => `\u{1F510} <b>Kode akses model aktif</b> sampai ${until}: API key kamu hanya bisa memakai ${models}.`,
+    stopped: (code) => `\u{1F6D1} Akses dari kode <code>${code}</code> dihentikan oleh admin. Akses model kamu kembali normal.`,
+    more: 'lainnya',
+    length: durationText,
+    left: (ms) => `sisa ${durationText(ms)}`,
+  },
+  en: {
+    failures: {
+      not_found: '\u{274C} Code not found. Check the code and try again.',
+      already_redeemed: '\u{26A0}\u{FE0F} You have already redeemed this code.',
+      used: '\u{26D4} This code has already been used. Each model access code can be redeemed only once.',
+      disabled: '\u{1F6AB} This code has been disabled by the admin.',
+      expired: '\u{231B} This code has expired: its redeem deadline or access period is over.',
+      error: '\u{274C} This code cannot be redeemed right now. Please try again later.',
+    },
+    title: '\u{1F389} <b>Model access code redeemed!</b>',
+    code: 'Code',
+    models: 'Models',
+    period: 'Valid',
+    scheduled: (start) => `\u{23F3} Access starts <b>${start}</b>. Until then your model access stays as usual.`,
+    combined: 'Together with your other active access codes, the models you can use now',
+    rule: '\u{26A0}\u{FE0F} During this period your API keys can <b>only use the models above</b>; other models are rejected. When the period ends, your model access goes back to normal automatically.',
+    billing: '\u{1F4B3} Usage is still charged to your balance / bonus tokens at the model price.',
+    tryAnother: '\u{1F501} Try another code',
+    back: '\u{1F519} Back to menu',
+    cardTitle: '\u{1F510} <b>Model Access Code</b>',
+    cardOnly: 'Only these models can be used',
+    cardUntil: 'until',
+    cardStarts: 'starts',
+    notice: (models, until) => `\u{1F510} <b>Model access code active</b> until ${until}: your API keys can only use ${models}.`,
+    stopped: (code) => `\u{1F6D1} The access from code <code>${code}</code> was stopped by the admin. Your model access is back to normal.`,
+    more: 'more',
+    length: durationTextEn,
+    left: (ms) => `${durationTextEn(ms)} left`,
+  },
+};
+
+function accessUserText(lang) {
+  return ACCESS_USER_TEXT[lang] || ACCESS_USER_TEXT[DEFAULT_LANGUAGE];
+}
+
+function accessStatusLabel(status) {
+  return ACCESS_STATUS_LABELS[status] || escapeHtml(status || '-');
+}
+
+// "<code>a</code> • <code>b</code> • +3 lainnya" (escaped), limited so long lists fit in a message.
+function accessModelsText(models, limit = 6, more = 'lainnya') {
+  const list = Array.isArray(models) ? models : [];
+  if (!list.length) return '<i>belum ada</i>';
+  const shown = list.slice(0, limit).map((model) => `<code>${escapeHtml(model)}</code>`).join(' \u{2022} ');
+  return list.length > limit ? `${shown} \u{2022} +${list.length - limit} ${more}` : shown;
+}
+
+// How a code's (or a draft's) period is counted, for the admin screens.
+function accessPeriodText(entry) {
+  if (entry.kind === 'duration') {
+    return entry.durationMs ? `${durationText(entry.durationMs)} sejak kode ditukar` : '<i>durasi belum diatur</i>';
+  }
+  const start = entry.startsAt ? escapeHtml(wibTime(entry.startsAt)) : 'saat kode dibuat';
+  const end = entry.endsAt ? escapeHtml(wibTime(entry.endsAt)) : '<i>belum diatur</i>';
+  return `${start} \u{2192} ${end}`;
+}
+
+function accessDeadlineText(draft) {
+  if (draft.kind === 'range') return 'sampai periode berakhir';
+  return draft.expiresAt
+    ? escapeHtml(wibTime(draft.expiresAt))
+    : `${durationText(ACCESS_DEFAULT_REDEEM_WINDOW_MS)} setelah kode dibuat (default)`;
+}
+
+function accessUserLabel(redemption) {
+  const name = redemption.firstName || (redemption.username ? `@${redemption.username}` : `ID ${redemption.telegramId}`);
+  return `<b>${escapeHtml(name)}</b> <code>${escapeHtml(redemption.telegramId)}</code>`;
+}
+
+function newAccessDraft() {
+  return { models: [], kind: 'duration', durationMs: null, expiresAt: null, startsAt: null, endsAt: null };
+}
+
+function accessDraft(userId) {
+  return accessCodeDrafts.get(String(userId)) || null;
+}
+
+function accessDraftComplete(draft) {
+  return draft.models.length > 0 && (draft.kind === 'duration' ? Boolean(draft.durationMs) : Boolean(draft.endsAt));
+}
+
+// API Dashboard card for a user's active / upcoming access codes; '' when there are none.
+function modelAccessCard(access, lang = DEFAULT_LANGUAGE) {
+  if (!access || (!access.restricted && !(access.scheduled || []).length)) return '';
+  const t = accessUserText(lang);
+  const now = Date.now();
+  const lines = [];
+  if (access.restricted) {
+    lines.push(`\u{2705} ${t.cardOnly}: ${accessModelsText(access.allowedModels, 12, t.more)}`);
+    for (const grant of access.active.slice(0, 5)) {
+      lines.push(`<code>${escapeHtml(grant.code)}</code> ${t.cardUntil} ${escapeHtml(wibTime(grant.endsAt))} (${t.left(Date.parse(grant.endsAt) - now)})`);
+    }
+  }
+  for (const grant of (access.scheduled || []).slice(0, 5)) {
+    lines.push(`\u{23F3} <code>${escapeHtml(grant.code)}</code> ${t.cardStarts} ${escapeHtml(wibTime(grant.startsAt))}: ${accessModelsText(grant.models, 4, t.more)}`);
+  }
+  return card(t.cardTitle, lines);
+}
+
+// One line for screens that list models (Model Price) while a code restricts the user.
+function modelAccessNotice(access, lang = DEFAULT_LANGUAGE) {
+  const t = accessUserText(lang);
+  return t.notice(accessModelsText(access.allowedModels, 12, t.more), escapeHtml(wibTime(access.restrictedUntil)));
+}
+
+// A user sent an MDL-... code (Redeem Code button, /redeem <code>, or just the code).
+async function performAccessRedeem(chatId, from, rawCode) {
+  const account = await getUser(from.id).catch(() => null);
+  const t = accessUserText(userLanguage(account));
+  let result;
+  try {
+    result = await redeemAccessCode(from.id, rawCode, { firstName: from.first_name, username: from.username });
+  } catch (error) {
+    // E.g. an API server that has no model access codes yet.
+    console.error('[access-code] redeem failed:', error.message);
+    result = { ok: false, reason: 'error' };
+  }
+  if (!result || !result.ok) {
+    return telegram('sendMessage', {
+      chat_id: chatId,
+      text: t.failures[result?.reason] || t.failures.error,
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: t.tryAnother, callback_data: 'redeem' }], [{ text: t.back, callback_data: 'menu' }]] },
+    });
+  }
+  const length = Date.parse(result.endsAt) - Date.parse(result.startsAt);
+  const allowed = result.access?.allowedModels || [];
+  const lines = [
+    t.title,
+    '',
+    `${t.code}: <code>${escapeHtml(result.code)}</code>`,
+    `\u{1F916} ${t.models}: ${accessModelsText(result.models, ACCESS_MAX_MODELS, t.more)}`,
+    `\u{1F552} ${t.period}: <b>${escapeHtml(wibTime(result.startsAt))}</b> \u{2192} <b>${escapeHtml(wibTime(result.endsAt))}</b> (${t.length(length)})`,
+    ...(result.status === 'scheduled' ? ['', t.scheduled(escapeHtml(wibTime(result.startsAt)))] : []),
+    ...(allowed.some((model) => !result.models.includes(model)) ? ['', `\u{2139}\u{FE0F} ${t.combined}: ${accessModelsText(allowed, 20, t.more)}`] : []),
+    '',
+    t.rule,
+    t.billing,
+  ];
+  await telegram('sendMessage', { chat_id: chatId, text: lines.join('\n'), parse_mode: 'HTML', reply_markup: menuKeyboard(from.id) });
+  if (!isAdmin(from.id)) {
+    const who = escapeHtml(from.first_name || from.username || from.id);
+    await telegram('sendMessage', {
+      chat_id: ADMIN_TELEGRAM_ID,
+      text: [
+        `\u{1F510} <b>${who}</b> (<code>${escapeHtml(from.id)}</code>) menukarkan kode akses <code>${escapeHtml(result.code)}</code>`,
+        `Model: ${accessModelsText(result.models, 6)}`,
+        `Akses: ${escapeHtml(wibTime(result.startsAt))} \u{2192} ${escapeHtml(wibTime(result.endsAt))}`,
+      ].join('\n'),
+      parse_mode: 'HTML',
+    }).catch(() => {});
+  }
+  return null;
+}
+
+// Main screen: what the feature does and the latest codes.
+async function adminAccessCodesView(notice = '') {
+  const codes = await listAccessCodes(ACCESS_CODES_SHOWN);
+  const lines = [
+    ...(notice ? [notice, ''] : []),
+    '\u{1F510} <b>Kode Akses Model</b>',
+    '',
+    'Kode unik <b>sekali pakai</b> yang mengikat model pilihan dan periode. User yang menukarkannya <b>hanya bisa memakai model tersebut</b> selama periode berlaku; model lain ditolak. Setelah periode selesai, akses model user kembali normal otomatis. Harga &amp; saldo tetap seperti biasa.',
+    '',
+    codes.length ? `\u{1F4CB} <b>Kode terbaru</b> (${codes.length})` : '\u{1F4CB} Belum ada kode.',
+    ...codes.map((entry) => [
+      `<code>${escapeHtml(entry.code)}</code> ${accessStatusLabel(entry.status)}`,
+      `   ${accessModelsText(entry.models, 3)}`,
+      `   ${accessPeriodText(entry)}`,
+    ].join('\n')),
+  ];
+  const rows = [[{ text: '\u{2795} Buat Kode', callback_data: 'admin_mac_new' }]];
+  const detailButtons = codes.map((entry) => ({ text: `\u{1F50D} ${entry.code}`, callback_data: `admin_mac_v_${entry.code}` }));
+  for (let i = 0; i < detailButtons.length; i += 2) rows.push(detailButtons.slice(i, i + 2));
+  rows.push([{ text: '\u{1F504} Refresh', callback_data: 'admin_mac_list' }, { text: '\u{1F519} Back to admin panel', callback_data: 'admin_panel' }]);
+  return { text: lines.join('\n'), reply_markup: { inline_keyboard: rows } };
+}
+
+async function adminAccessCodeView(rawCode, notice = '') {
+  const entry = await getAccessCode(rawCode);
+  if (!entry) return adminAccessCodesView('\u{274C} Kode tidak ditemukan.');
+  const redemption = entry.redemption;
+  const lines = [
+    ...(notice ? [notice, ''] : []),
+    `\u{1F510} <b>Kode Akses</b> <code>${escapeHtml(entry.code)}</code>`,
+    `Status: <b>${accessStatusLabel(entry.status)}</b>`,
+    '',
+    `\u{1F916} Model (${entry.models.length}): ${accessModelsText(entry.models, ACCESS_MAX_MODELS)}`,
+    `\u{1F552} Periode: <b>${accessPeriodText(entry)}</b>`,
+    `\u{23F3} Batas redeem: <b>${escapeHtml(wibTime(entry.expiresAt))}</b>`,
+    `\u{1F4C5} Dibuat: ${escapeHtml(wibTime(entry.createdAt))}`,
+  ];
+  if (redemption) {
+    lines.push(
+      '',
+      `\u{1F464} Ditukar oleh: ${accessUserLabel(redemption)}`,
+      `   pada ${escapeHtml(wibTime(redemption.at))}`,
+      `\u{1F510} Akses: ${escapeHtml(wibTime(redemption.startsAt))} \u{2192} ${escapeHtml(wibTime(redemption.endsAt))}`,
+    );
+    if (entry.status === 'in_use') lines.push(`   sisa ${durationText(Date.parse(redemption.endsAt) - Date.now())}`);
+    if (redemption.revokedAt) lines.push(`\u{1F6D1} Dihentikan: ${escapeHtml(wibTime(redemption.revokedAt))}`);
+  } else if (entry.disabledAt) {
+    lines.push('', `\u{1F6AB} Dinonaktifkan: ${escapeHtml(wibTime(entry.disabledAt))}`);
+  }
+  const rows = [];
+  if (entry.status === 'available') rows.push([{ text: '\u{1F6AB} Nonaktifkan kode', callback_data: `admin_mac_off_${entry.code}` }]);
+  if (entry.status === 'in_use' || entry.status === 'scheduled') {
+    rows.push([{ text: '\u{1F6D1} Hentikan akses user', callback_data: `admin_mac_off_${entry.code}` }]);
+  }
+  rows.push([{ text: '\u{1F519} Kembali ke daftar', callback_data: 'admin_mac_list' }]);
+  return { text: lines.join('\n'), reply_markup: { inline_keyboard: rows } };
+}
+
+// Step 1: one or more models, family by family.
+async function adminAccessTargetsView(userId, notice = '') {
+  const models = await ensureModelCache();
+  const draft = accessDraft(userId);
+  const familyButtons = MODEL_FAMILIES.map((family, index) => {
+    const list = models.filter((model) => getModelFamily(model) === family);
+    const picked = list.filter((model) => draft.models.includes(model.toLowerCase())).length;
+    const icon = picked && picked === list.length ? '\u{2705}' : picked ? '\u{2611}\u{FE0F}' : '\u{26AA}';
+    return { text: `${icon} ${family} (${picked}/${list.length})`, callback_data: `admin_mac_fam_${index}` };
+  });
+  const rows = [];
+  for (let i = 0; i < familyButtons.length; i += 2) rows.push(familyButtons.slice(i, i + 2));
+  if (draft.models.length) rows.push([{ text: '\u{1F9F9} Kosongkan pilihan', callback_data: 'admin_mac_clear' }]);
+  rows.push([{ text: '\u{27A1}\u{FE0F} Lanjut: atur periode', callback_data: 'admin_mac_next' }]);
+  rows.push([{ text: '\u{274C} Batal', callback_data: 'admin_mac_cancel' }]);
+  const text = [
+    ...(notice ? [notice, ''] : []),
+    '\u{1F510} <b>Buat Kode Akses</b> \u{2014} 1/3 Pilih model',
+    '',
+    `Tap family untuk memilih modelnya (satu atau lebih, maks. ${ACCESS_MAX_MODELS}). User yang menukarkan kode hanya bisa memakai model yang dipilih di sini.`,
+    '\u{2705} semua model family \u{2022} \u{2611}\u{FE0F} sebagian \u{2022} \u{26AA} belum dipilih',
+    '',
+    `Dipilih (${draft.models.length}): ${accessModelsText(draft.models, 12)}`,
+  ].join('\n');
+  return { text, reply_markup: { inline_keyboard: rows } };
+}
+
+async function adminAccessFamilyView(userId, familyIndex, notice = '') {
+  await ensureModelCache();
+  const family = MODEL_FAMILIES[familyIndex];
+  const list = familyModels(familyIndex);
+  const draft = accessDraft(userId);
+  const buttons = list.map((model, modelIndex) => {
+    const picked = draft.models.includes(model.toLowerCase());
+    return { text: `${picked ? '\u{2705}' : '\u{26AA}'} ${model}`.slice(0, 60), callback_data: `admin_mac_mt_${familyIndex}_${modelIndex}` };
+  });
+  const rows = [];
+  for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
+  if (list.length) {
+    rows.push([
+      { text: `\u{2705} Pilih semua ${family}`, callback_data: `admin_mac_fall_${familyIndex}` },
+      { text: '\u{2716}\u{FE0F} Hapus semua', callback_data: `admin_mac_fnone_${familyIndex}` },
+    ]);
+  }
+  rows.push([{ text: '\u{1F519} Kembali ke family', callback_data: 'admin_mac_targets' }]);
+  const body = list.length
+    ? `\u{1F510} <b>Kode Akses \u{2014} ${escapeHtml(family)}</b> (${list.length} model)\n\nTap model untuk pilih/batal. \u{2705} dipilih \u{2022} \u{26AA} tidak\nTotal dipilih: <b>${draft.models.length}</b>/${ACCESS_MAX_MODELS}`
+    : `\u{1F510} <b>Kode Akses \u{2014} ${escapeHtml(family)}</b>\n\nUpstream tidak mengembalikan model untuk family ini. Coba Resync models di menu Disable Model.`;
+  return { text: notice ? `${notice}\n\n${body}` : body, reply_markup: { inline_keyboard: rows } };
+}
+
+// Step 2: how the period is counted, and its length / window.
+function adminAccessPeriodView(draft, notice = '') {
+  const isDuration = draft.kind === 'duration';
+  const rows = [[
+    { text: `${isDuration ? '\u{2705} ' : ''}\u{23F1}\u{FE0F} Durasi sejak ditukar`, callback_data: 'admin_mac_kind_dur' },
+    { text: `${isDuration ? '' : '\u{2705} '}\u{1F4C5} Rentang waktu tetap`, callback_data: 'admin_mac_kind_rng' },
+  ]];
+  let settings;
+  if (isDuration) {
+    for (let i = 0; i < ACCESS_DURATIONS.length; i += 3) {
+      rows.push(ACCESS_DURATIONS.slice(i, i + 3).map(([label, minutes]) => ({
+        text: `${draft.durationMs === minutes * 60_000 ? '\u{2705} ' : ''}${label}`,
+        callback_data: `admin_mac_dur_${minutes}`,
+      })));
+    }
+    rows.push([{ text: '\u{270F}\u{FE0F} Ketik durasi', callback_data: 'admin_mac_in_duration' }, { text: '\u{23F3} Atur batas redeem', callback_data: 'admin_mac_in_expires' }]);
+    if (draft.expiresAt) rows.push([{ text: '\u{21A9}\u{FE0F} Batas redeem default', callback_data: 'admin_mac_exp_default' }]);
+    settings = [
+      `Durasi akses: <b>${draft.durationMs ? durationText(draft.durationMs) : '<i>belum diatur</i>'}</b>`,
+      `Batas redeem: <b>${accessDeadlineText(draft)}</b>`,
+    ];
+  } else {
+    rows.push([{ text: '\u{1F552} Atur waktu mulai', callback_data: 'admin_mac_in_start' }, { text: '\u{23F0} Atur waktu berakhir', callback_data: 'admin_mac_in_end' }]);
+    if (draft.startsAt) rows.push([{ text: '\u{25B6}\u{FE0F} Mulai sekarang saja', callback_data: 'admin_mac_start_now' }]);
+    settings = [
+      `Mulai: <b>${draft.startsAt ? escapeHtml(wibTime(draft.startsAt)) : 'Sekarang (saat kode dibuat)'}</b>`,
+      `Berakhir: <b>${draft.endsAt ? escapeHtml(wibTime(draft.endsAt)) : '<i>belum diatur</i>'}</b>`,
+    ];
+  }
+  if (accessDraftComplete(draft)) rows.push([{ text: '\u{27A1}\u{FE0F} Lanjut: konfirmasi', callback_data: 'admin_mac_confirm' }]);
+  rows.push([{ text: '\u{1F519} Ubah model', callback_data: 'admin_mac_targets' }, { text: '\u{274C} Batal', callback_data: 'admin_mac_cancel' }]);
+  const text = [
+    ...(notice ? [notice, ''] : []),
+    '\u{1F510} <b>Buat Kode Akses</b> \u{2014} 2/3 Atur periode',
+    '',
+    `Model (${draft.models.length}): ${accessModelsText(draft.models, 8)}`,
+    '',
+    '\u{23F1}\u{FE0F} <b>Durasi sejak ditukar</b>: masa akses mulai saat user menukarkan kode. Kode bisa ditukar sampai batas redeem.',
+    '\u{1F4C5} <b>Rentang waktu tetap</b>: akses hanya berlaku antara waktu mulai &amp; berakhir (WIB), kapan pun kode ditukar. Lewat waktu berakhir, kode kedaluwarsa.',
+    '',
+    ...settings,
+    '',
+    `<i>Periode maksimal ${durationText(ACCESS_MAX_PERIOD_MS)}.</i>`,
+  ].join('\n');
+  return { text, reply_markup: { inline_keyboard: rows } };
+}
+
+// Step 3.
+async function adminAccessConfirmView(draft, notice = '') {
+  // A picked model that is disabled right now stays unusable; say so before the code goes out.
+  const disabled = await getDisabledModels().catch(() => null);
+  const off = disabled ? draft.models.filter((model) => isDisabledIn(disabled, model)) : [];
+  const text = [
+    ...(notice ? [notice, ''] : []),
+    '\u{1F510} <b>Buat Kode Akses</b> \u{2014} 3/3 Konfirmasi',
+    '',
+    `\u{1F916} Model (${draft.models.length}): ${accessModelsText(draft.models, ACCESS_MAX_MODELS)}`,
+    `\u{1F552} Periode: <b>${accessPeriodText(draft)}</b>`,
+    `\u{23F3} Batas redeem: <b>${accessDeadlineText(draft)}</b>`,
+    ...(off.length ? ['', `\u{26A0}\u{FE0F} Sedang di-disable (tetap tidak bisa dipakai sampai di-enable lagi): ${accessModelsText(off, 10)}`] : []),
+    '',
+    'Kode ini <b>sekali pakai</b> (1 user). Selama periode akses, user itu <b>hanya bisa memakai model di atas</b> lewat API: model lain ditolak dan tidak tampil di <code>/v1/models</code>. Setelah periode berakhir, akses model kembali normal otomatis.',
+    '<i>Harga, saldo, bonus token, BANSOS dan rate limit tetap berlaku seperti biasa.</i>',
+  ].join('\n');
+  return { text, reply_markup: { inline_keyboard: [
+    [{ text: '\u{2705} Buat kode', callback_data: 'admin_mac_go' }],
+    [{ text: '\u{1F519} Ubah periode', callback_data: 'admin_mac_next' }, { text: '\u{274C} Batal', callback_data: 'admin_mac_cancel' }],
+  ] } };
+}
+
+function adminAccessCreatedView(entry) {
+  const text = [
+    '\u{2705} <b>Kode akses dibuat!</b>',
+    '',
+    `Kode: <code>${escapeHtml(entry.code)}</code>`,
+    `\u{1F916} Model (${entry.models.length}): ${accessModelsText(entry.models, ACCESS_MAX_MODELS)}`,
+    `\u{1F552} Periode: <b>${accessPeriodText(entry)}</b>`,
+    `\u{23F3} Batas redeem: <b>${escapeHtml(wibTime(entry.expiresAt))}</b>`,
+    '',
+    'Tap kode untuk copy, lalu kirim ke user. User menukarkannya lewat <b>Redeem Code</b> di menu, atau dengan:',
+    `<code>/redeem ${escapeHtml(entry.code)}</code>`,
+  ].join('\n');
+  return { text, reply_markup: { inline_keyboard: [
+    [{ text: '\u{2795} Buat 1 lagi (pengaturan sama)', callback_data: 'admin_mac_again' }],
+    [{ text: '\u{1F4CB} Daftar kode', callback_data: 'admin_mac_list' }, { text: '\u{1F519} Back to admin panel', callback_data: 'admin_panel' }],
+  ] } };
+}
+
+function promptAccessInput(chatId, userId, field) {
+  const draft = accessDraft(userId);
+  pendingAdminAccess.set(String(userId), field);
+  const nextHour = Math.ceil(Date.now() / 3_600_000) * 3_600_000;
+  const base = draft?.startsAt ? Date.parse(draft.startsAt) : nextHour;
+  const formats = 'format <code>YYYY-MM-DD HH:MM</code> atau <code>DD/MM/YYYY HH:MM</code>';
+  const texts = {
+    duration: '\u{270F}\u{FE0F} Kirim <b>durasi akses</b> (dihitung sejak user menukarkan kode), contoh <code>90m</code>, <code>12j</code>, <code>45hari</code>. Maksimal 365 hari.',
+    expires: `\u{23F3} Kirim <b>batas redeem</b> (WIB), ${formats}.\nContoh: <code>${wibInputFormat(nextHour + 7 * 86_400_000)}</code>\nAtau lamanya dari sekarang: <code>12j</code>, <code>7hari</code>. Setelah batas ini kode tidak bisa ditukar lagi.`,
+    start: `\u{1F552} Kirim <b>waktu mulai</b> akses (WIB), ${formats}.\nContoh: <code>${wibInputFormat(nextHour + 86_400_000)}</code>\nAtau kirim <code>sekarang</code>.`,
+    end: `\u{23F0} Kirim <b>waktu berakhir</b> akses (WIB), ${formats}.\nContoh: <code>${wibInputFormat(base + 7 * 86_400_000)}</code>\nAtau lamanya dari waktu mulai: <code>12j</code>, <code>7hari</code>.`,
+  };
+  return telegram('sendMessage', {
+    chat_id: chatId,
+    text: texts[field],
+    parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: [[{ text: '\u{1F519} Batal', callback_data: 'admin_mac_next' }]] },
+  });
+}
+
+// Typed value for the draft (see promptAccessInput): saves it and shows the next step, or replies
+// with what is wrong and keeps waiting for a corrected value.
+async function handleAccessCodeInput(chatId, userId, text) {
+  const field = pendingAdminAccess.get(userId);
+  const draft = accessDraft(userId);
+  const send = (view) => telegram('sendMessage', { chat_id: chatId, text: view.text, parse_mode: 'HTML', reply_markup: view.reply_markup });
+  if (!draft) {
+    pendingAdminAccess.delete(userId);
+    return send(await adminAccessCodesView('\u{26A0}\u{FE0F} Draft kode akses tidak ditemukan (mungkin bot baru restart). Mulai lagi dengan \u{2795} Buat Kode.'));
+  }
+  const reject = (reason) => telegram('sendMessage', { chat_id: chatId, text: `\u{274C} ${reason}`, parse_mode: 'HTML' });
+  const value = text.trim();
+  const now = Date.now();
+  if (field === 'duration') {
+    const duration = parseDurationText(value);
+    if (!duration) return reject('Format tidak dikenali. Contoh: <code>90m</code>, <code>12j</code>, <code>45hari</code>.');
+    if (duration < ACCESS_MIN_PERIOD_MS) return reject('Durasi akses minimal 1 menit.');
+    if (duration > ACCESS_MAX_PERIOD_MS) return reject('Durasi akses maksimal 365 hari.');
+    pendingAdminAccess.delete(userId);
+    draft.kind = 'duration';
+    draft.durationMs = duration;
+    return send(await adminAccessConfirmView(draft));
+  }
+  if (field === 'expires') {
+    const length = parseDurationText(value);
+    const time = length ? now + length : parseWibDateTime(value);
+    if (time === null) return reject('Format tidak dikenali. Contoh: <code>2026-10-20 23:59</code>, <code>12j</code> atau <code>7hari</code>.');
+    if (time - now < ACCESS_MIN_PERIOD_MS) return reject('Batas redeem harus minimal 1 menit dari sekarang.');
+    if (time - now > ACCESS_MAX_AHEAD_MS) return reject('Batas redeem maksimal 365 hari dari sekarang.');
+    pendingAdminAccess.delete(userId);
+    draft.expiresAt = new Date(time).toISOString();
+    return send(adminAccessPeriodView(draft, '\u{2705} Batas redeem disimpan.'));
+  }
+  if (field === 'start') {
+    const startNow = /^(sekarang|now)$/i.test(value);
+    const time = startNow ? null : parseWibDateTime(value);
+    if (!startNow && time === null) return reject('Format tidak dikenali. Contoh: <code>2026-10-05 08:00</code>, atau <code>sekarang</code>.');
+    if (!startNow && time <= now) return reject('Waktu mulai sudah lewat. Kirim waktu yang akan datang, atau <code>sekarang</code>.');
+    if (!startNow && time - now > ACCESS_MAX_AHEAD_MS) return reject('Waktu mulai maksimal 365 hari dari sekarang.');
+    pendingAdminAccess.delete(userId);
+    draft.kind = 'range';
+    draft.startsAt = startNow ? null : new Date(time).toISOString();
+    let notice = '\u{2705} Waktu mulai disimpan.';
+    // A typed end time that no longer fits the new start has to be set again.
+    const length = draft.endsAt ? Date.parse(draft.endsAt) - (time || now) : 0;
+    if (draft.endsAt && (length < ACCESS_MIN_PERIOD_MS || length > ACCESS_MAX_PERIOD_MS)) {
+      draft.endsAt = null;
+      notice += ' Waktu berakhir sebelumnya jadi tidak valid, atur lagi.';
+    }
+    return send(adminAccessPeriodView(draft, notice));
+  }
+  if (field === 'end') {
+    const start = draft.startsAt ? Date.parse(draft.startsAt) : now;
+    const length = parseDurationText(value);
+    const time = length ? start + length : parseWibDateTime(value);
+    if (time === null) return reject('Format tidak dikenali. Contoh: <code>2026-10-12 20:00</code>, <code>12j</code> atau <code>7hari</code>.');
+    if (time <= now) return reject('Waktu berakhir sudah lewat.');
+    if (time - start < ACCESS_MIN_PERIOD_MS) return reject('Waktu berakhir harus minimal 1 menit setelah waktu mulai.');
+    if (time - start > ACCESS_MAX_PERIOD_MS) return reject('Periode akses maksimal 365 hari.');
+    pendingAdminAccess.delete(userId);
+    draft.kind = 'range';
+    draft.endsAt = new Date(time).toISOString();
+    return send(await adminAccessConfirmView(draft));
+  }
+  pendingAdminAccess.delete(userId);
+  return send(adminAccessPeriodView(draft));
+}
+
+// Every admin_mac* button (admin-only: checked for every admin_ action before this runs, and again
+// by the API server for creating / disabling). Returns the Telegram call to make.
+async function handleAccessCodeAction(query, action) {
+  const chatId = query.message.chat.id;
+  const userId = String(query.from.id);
+  if (action === 'admin_mac') {
+    // Opened from the admin panel: a new message, like the other admin screens.
+    const view = await adminAccessCodesView();
+    return telegram('sendMessage', { chat_id: chatId, text: view.text, parse_mode: 'HTML', reply_markup: view.reply_markup });
+  }
+  if (action === 'admin_mac_list') return showAdminView(query, await adminAccessCodesView());
+  if (action.startsWith('admin_mac_v_')) return showAdminView(query, await adminAccessCodeView(action.slice('admin_mac_v_'.length)));
+  if (action.startsWith('admin_mac_offok_')) {
+    const result = await disableAccessCode(action.slice('admin_mac_offok_'.length), userId);
+    if (!result) return showAdminView(query, await adminAccessCodesView('\u{274C} Kode tidak ditemukan.'));
+    let notice = 'Kode ini sudah tidak aktif, tidak ada yang diubah.';
+    if (result.changed && result.previousStatus === 'available') {
+      notice = '\u{1F6AB} Kode dinonaktifkan dan tidak bisa ditukar lagi.';
+    } else if (result.changed) {
+      notice = '\u{1F6D1} Akses dihentikan. Akses model user kembali normal.';
+      const target = result.code.redemption?.telegramId;
+      if (target) {
+        const account = await getUser(target).catch(() => null);
+        await telegram('sendMessage', {
+          chat_id: target,
+          text: accessUserText(userLanguage(account)).stopped(escapeHtml(result.code.code)),
+          parse_mode: 'HTML',
+          reply_markup: menuKeyboard(target),
+        }).catch(() => {});
+      }
+    }
+    return showAdminView(query, await adminAccessCodeView(result.code.code, notice));
+  }
+  if (action.startsWith('admin_mac_off_')) {
+    // Two-step: this only asks; the change runs on the confirm button.
+    const entry = await getAccessCode(action.slice('admin_mac_off_'.length));
+    if (!entry) return showAdminView(query, await adminAccessCodesView('\u{274C} Kode tidak ditemukan.'));
+    const running = entry.status === 'in_use' || entry.status === 'scheduled';
+    if (!running && entry.status !== 'available') return showAdminView(query, await adminAccessCodeView(entry.code, 'Kode ini sudah tidak aktif.'));
+    const code = escapeHtml(entry.code);
+    const text = running
+      ? `\u{1F6D1} Hentikan akses dari kode <code>${code}</code> sekarang?\n\n${accessUserLabel(entry.redemption)} tidak lagi dibatasi oleh kode ini; akses modelnya kembali normal (kecuali masih punya kode akses lain yang aktif). Tidak bisa dibatalkan.`
+      : `\u{1F6AB} Nonaktifkan kode <code>${code}</code>?\n\nKode tidak bisa ditukar lagi. Tidak bisa dibatalkan.`;
+    return showAdminView(query, { text, reply_markup: { inline_keyboard: [[
+      { text: running ? '\u{2705} Ya, hentikan' : '\u{2705} Ya, nonaktifkan', callback_data: `admin_mac_offok_${entry.code}` },
+      { text: '\u{274C} Batal', callback_data: `admin_mac_v_${entry.code}` },
+    ]] } });
+  }
+  if (action === 'admin_mac_new') {
+    accessCodeDrafts.set(userId, newAccessDraft());
+    return showAdminView(query, await adminAccessTargetsView(userId));
+  }
+  if (action === 'admin_mac_cancel') {
+    accessCodeDrafts.delete(userId);
+    return showAdminView(query, await adminAccessCodesView('Pembuatan kode dibatalkan.'));
+  }
+
+  const draft = accessDraft(userId);
+  if (!draft) {
+    return showAdminView(query, await adminAccessCodesView('\u{26A0}\u{FE0F} Draft kode akses tidak ditemukan (mungkin bot baru restart). Mulai lagi dengan \u{2795} Buat Kode.'));
+  }
+  if (action === 'admin_mac_targets') return showAdminView(query, await adminAccessTargetsView(userId));
+  if (action === 'admin_mac_clear') {
+    draft.models = [];
+    return showAdminView(query, await adminAccessTargetsView(userId));
+  }
+  if (action.startsWith('admin_mac_fam_')) {
+    const familyIndex = Number(action.slice('admin_mac_fam_'.length));
+    if (!MODEL_FAMILIES[familyIndex]) return showAdminView(query, await adminAccessTargetsView(userId));
+    return showAdminView(query, await adminAccessFamilyView(userId, familyIndex));
+  }
+  if (action.startsWith('admin_mac_mt_')) {
+    const [familyText, modelText] = action.slice('admin_mac_mt_'.length).split('_');
+    const familyIndex = Number(familyText);
+    await ensureModelCache();
+    const model = MODEL_FAMILIES[familyIndex] ? familyModels(familyIndex)[Number(modelText)] : undefined;
+    if (!model) return showAdminView(query, await adminAccessTargetsView(userId));
+    const key = model.toLowerCase();
+    if (!draft.models.includes(key) && draft.models.length >= ACCESS_MAX_MODELS) {
+      return showAdminView(query, await adminAccessFamilyView(userId, familyIndex, `\u{26A0}\u{FE0F} Maksimal ${ACCESS_MAX_MODELS} model per kode.`));
+    }
+    draft.models = toggleIn(draft.models, key);
+    return showAdminView(query, await adminAccessFamilyView(userId, familyIndex));
+  }
+  if (action.startsWith('admin_mac_fall_') || action.startsWith('admin_mac_fnone_')) {
+    const all = action.startsWith('admin_mac_fall_');
+    const familyIndex = Number(action.slice((all ? 'admin_mac_fall_' : 'admin_mac_fnone_').length));
+    if (!MODEL_FAMILIES[familyIndex]) return showAdminView(query, await adminAccessTargetsView(userId));
+    await ensureModelCache();
+    const keys = familyModels(familyIndex).map((model) => model.toLowerCase());
+    let notice = '';
+    if (!all) {
+      draft.models = draft.models.filter((key) => !keys.includes(key));
+    } else {
+      const merged = [...new Set([...draft.models, ...keys])];
+      if (merged.length > ACCESS_MAX_MODELS) notice = `\u{26A0}\u{FE0F} Maksimal ${ACCESS_MAX_MODELS} model per kode: pilih model satu per satu.`;
+      else draft.models = merged;
+    }
+    return showAdminView(query, await adminAccessFamilyView(userId, familyIndex, notice));
+  }
+  if (action === 'admin_mac_next') {
+    if (!draft.models.length) return showAdminView(query, await adminAccessTargetsView(userId, '\u{26A0}\u{FE0F} Pilih minimal satu model dulu.'));
+    return showAdminView(query, adminAccessPeriodView(draft));
+  }
+  if (action === 'admin_mac_kind_dur' || action === 'admin_mac_kind_rng') {
+    draft.kind = action === 'admin_mac_kind_dur' ? 'duration' : 'range';
+    return showAdminView(query, adminAccessPeriodView(draft));
+  }
+  if (action.startsWith('admin_mac_dur_')) {
+    const minutes = Number(action.slice('admin_mac_dur_'.length));
+    if (!ACCESS_DURATIONS.some(([, value]) => value === minutes)) return showAdminView(query, adminAccessPeriodView(draft));
+    draft.kind = 'duration';
+    draft.durationMs = minutes * 60_000;
+    return showAdminView(query, await adminAccessConfirmView(draft));
+  }
+  if (action.startsWith('admin_mac_in_')) {
+    const field = action.slice('admin_mac_in_'.length);
+    if (!ACCESS_INPUT_FIELDS.includes(field)) return showAdminView(query, adminAccessPeriodView(draft));
+    return promptAccessInput(chatId, userId, field);
+  }
+  if (action === 'admin_mac_start_now') {
+    draft.startsAt = null;
+    return showAdminView(query, adminAccessPeriodView(draft, '\u{2705} Akses mulai saat kode dibuat.'));
+  }
+  if (action === 'admin_mac_exp_default') {
+    draft.expiresAt = null;
+    return showAdminView(query, adminAccessPeriodView(draft, '\u{2705} Batas redeem kembali ke default.'));
+  }
+  if (action === 'admin_mac_confirm') {
+    if (!accessDraftComplete(draft)) return showAdminView(query, adminAccessPeriodView(draft, '\u{26A0}\u{FE0F} Atur periode dulu.'));
+    return showAdminView(query, await adminAccessConfirmView(draft));
+  }
+  if (action === 'admin_mac_go' || action === 'admin_mac_again') {
+    // "Again" posts a new message, so the code made before stays on screen to be copied.
+    const show = action === 'admin_mac_again'
+      ? (view) => telegram('sendMessage', { chat_id: chatId, text: view.text, parse_mode: 'HTML', reply_markup: view.reply_markup })
+      : (view) => showAdminView(query, view);
+    if (!draft.models.length) return show(await adminAccessTargetsView(userId, '\u{26A0}\u{FE0F} Pilih minimal satu model dulu.'));
+    if (!accessDraftComplete(draft)) return show(adminAccessPeriodView(draft, '\u{26A0}\u{FE0F} Atur periode dulu.'));
+    let created;
+    try {
+      created = await createAccessCode({
+        models: draft.models,
+        kind: draft.kind,
+        ...(draft.kind === 'duration'
+          ? { durationMs: draft.durationMs, expiresAt: draft.expiresAt }
+          : { startsAt: draft.startsAt, endsAt: draft.endsAt }),
+        createdBy: userId,
+      });
+    } catch (error) {
+      return show(await adminAccessConfirmView(draft, `\u{274C} ${escapeHtml(error.message)}`));
+    }
+    // The draft is kept so "Buat 1 lagi" can make another code with the same settings.
+    return show(adminAccessCreatedView(created));
+  }
+  return showAdminView(query, await adminAccessCodesView());
+}
+
 // ---------- Referral ----------
 
 async function getBotUsername() {
@@ -2401,6 +3104,13 @@ async function handleCallbackQuery(query) {
       return telegram('sendMessage', { chat_id: chatId, text: `\u{274C} BANSOS: ${escapeHtml(error.message)}`, parse_mode: 'HTML', reply_markup: adminBackKeyboard() });
     }
   }
+  if (action === 'admin_mac' || action.startsWith('admin_mac_')) {
+    try {
+      return await handleAccessCodeAction(query, action);
+    } catch (error) {
+      return telegram('sendMessage', { chat_id: chatId, text: `\u{274C} Kode Akses Model: ${escapeHtml(error.message)}`, parse_mode: 'HTML', reply_markup: adminBackKeyboard() });
+    }
+  }
   if (action === 'ticket_close') {
     const open = await getOpenTicketForUser(userId);
     const closed = open ? await closeTicket(open.id, 'user') : null;
@@ -2492,7 +3202,7 @@ async function handleCallbackQuery(query) {
     pendingUserRedeem.add(String(userId));
     return telegram('sendMessage', {
       chat_id: chatId,
-      text: '\u{1F39F}\u{FE0F} <b>Redeem Code</b>\n\nSend your redeem code now (example: <code>RDM-A1B2C3-D4E5F6</code>).\nThe nominal is added to your balance instantly.',
+      text: '\u{1F39F}\u{FE0F} <b>Redeem Code</b>\n\nSend your redeem code now (example: <code>RDM-A1B2C3-D4E5F6</code>).\nThe nominal is added to your balance instantly.\n\n\u{1F510} Model access codes (<code>MDL-...</code>) are redeemed here too: they unlock a set of models for a limited period.',
       parse_mode: 'HTML',
       reply_markup: { inline_keyboard: [[{ text: '\u{274C} Cancel', callback_data: 'menu' }]] },
     });
@@ -2654,7 +3364,7 @@ async function handleCallbackQuery(query) {
   }
   if (action === 'model_price') {
     try {
-      const text = await modelPriceMessage();
+      const text = await modelPriceMessage(userId);
       return telegram('sendMessage', { chat_id: chatId, text, parse_mode: 'HTML', reply_markup: modelKeyboard() });
     } catch (error) {
       return telegram('sendMessage', { chat_id: chatId, text: `\u{274C} Could not load model prices: ${escapeHtml(error.message)}`, parse_mode: 'HTML', reply_markup: modelKeyboard() });
@@ -2662,7 +3372,7 @@ async function handleCallbackQuery(query) {
   }
   if (action === 'model_resync') {
     try {
-      const text = await modelPriceMessage();
+      const text = await modelPriceMessage(userId);
       return telegram('sendMessage', { chat_id: chatId, text: `\u{2705} Models resynced from upstream.\n\n${text}`, parse_mode: 'HTML', reply_markup: modelKeyboard() });
     } catch (error) {
       return telegram('sendMessage', { chat_id: chatId, text: `\u{274C} Model resync failed: ${escapeHtml(error.message)}`, parse_mode: 'HTML', reply_markup: modelKeyboard() });
@@ -2802,6 +3512,14 @@ async function handleMessage(message) {
     }
     return;
   }
+  if (isAdmin(userId) && pendingAdminAccess.has(userId) && !text.startsWith('/')) {
+    try {
+      await handleAccessCodeInput(message.chat.id, userId, text);
+    } catch (error) {
+      await telegram('sendMessage', { chat_id: message.chat.id, text: `\u{274C} Kode Akses Model: ${escapeHtml(error.message)}`, parse_mode: 'HTML', reply_markup: adminBackKeyboard() });
+    }
+    return;
+  }
   if (isAdmin(userId) && pendingAdminRedeem.has(userId) && !text.startsWith('/')) {
     const pending = pendingAdminRedeem.get(userId);
     if (pending.step === 'amount') {
@@ -2833,7 +3551,7 @@ async function handleMessage(message) {
     }
     return;
   }
-  if ((pendingUserRedeem.has(userId) && !text.startsWith('/')) || REDEEM_CODE_PATTERN.test(text)) {
+  if ((pendingUserRedeem.has(userId) && !text.startsWith('/')) || REDEEM_CODE_PATTERN.test(text) || ACCESS_CODE_PATTERN.test(text)) {
     pendingUserRedeem.delete(userId);
     await performUserRedeem(message.chat.id, { ...user, id: userId }, text);
     return;
@@ -2913,7 +3631,7 @@ async function handleMessage(message) {
   }
   if (message.text === '/model' || message.text === '/models') {
     try {
-      const text = await modelPriceMessage();
+      const text = await modelPriceMessage(userId);
       await telegram('sendMessage', { chat_id: message.chat.id, text, parse_mode: 'HTML', reply_markup: modelKeyboard() });
     } catch (error) {
       await telegram('sendMessage', { chat_id: message.chat.id, text: `\u{274C} Could not sync models: ${escapeHtml(error.message)}`, parse_mode: 'HTML', reply_markup: menuKeyboard() });

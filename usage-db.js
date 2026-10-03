@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { getBillingPrice } = require('./pricing');
+const { getBillingPrice, getModelFamily, PINNED_MODELS } = require('./pricing');
 const { getReferralSettings } = require('./admin-settings');
 
 const configuredDatabasePath = process.env.USAGE_DB_PATH;
@@ -330,6 +330,321 @@ function disableRedeemCode(rawCode) {
 }
 
 // ---------------------------------------------------------------------------
+// Model access codes (bot: Admin Panel -> Kode Akses Model). The admin binds one or
+// more models and a period to a unique single-use code "MDL-XXXXXX-XXXXXX". The user
+// who redeems it gets a grant: while the grant is active their API keys may ONLY use
+// those models (server.js checks this on every /v1 request). Whether a grant is active
+// is worked out from the clock on every check, so once it ends the user's model access
+// is back to normal by itself; no timer is involved.
+//
+// Period kinds:
+//   duration  access lasts `durationMs` from the moment of redemption; the code can be
+//             redeemed until `expiresAt` (redeem deadline, default 30 days).
+//   range     access runs in the fixed window startsAt..endsAt; the code can be redeemed
+//             until endsAt. Redeemed before startsAt = the grant waits for startsAt.
+//
+// database.accessCodes = { <code>: { code, models: [model keys], kind, durationMs,
+//   startsAt, endsAt, expiresAt, active, createdAt, createdBy, disabledAt?, disabledBy?,
+//   redemption: null | { telegramId, at, startsAt, endsAt, revokedAt? } } }
+// user.modelAccess = [ { code, models, startsAt, endsAt, redeemedAt, revokedAt? } ]
+// Several active grants of one user add up: the user may use every model of all of them.
+// Creating and disabling codes is refused here unless the caller is ADMIN_TELEGRAM_ID.
+// ---------------------------------------------------------------------------
+
+// Same variable and default as server.js and telegram-bot.js.
+const ACCESS_ADMIN_ID = String(process.env.ADMIN_TELEGRAM_ID || '6957236291').trim();
+const ACCESS_CODE_PATTERN = /^MDL-[A-F0-9]{6}-[A-F0-9]{6}$/;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const MIN_ACCESS_PERIOD_MS = 60 * 1000;
+const MAX_ACCESS_PERIOD_MS = 365 * DAY_MS;
+const MAX_ACCESS_AHEAD_MS = 365 * DAY_MS; // latest start of a fixed window / redeem deadline
+const DEFAULT_ACCESS_REDEEM_WINDOW_MS = 30 * DAY_MS;
+const MAX_ACCESS_MODELS = 50;
+const MAX_ACCESS_GRANT_HISTORY = 20; // finished grants kept per user (open ones are never pruned)
+const ACCESS_MODEL_NAME = /^[a-z0-9][a-z0-9._:+-]{0,99}$/;
+const modelCachePath = path.join(__dirname, 'data', 'models.json');
+
+// Display name, lowercase: same key as admin-settings.js uses for disabled models.
+function accessModelKey(model) {
+  return String(model || '').trim().replace(/^.*\//, '').toLowerCase();
+}
+
+function isAccessAdmin(telegramId) {
+  return Boolean(ACCESS_ADMIN_ID) && String(telegramId ?? '').trim() === ACCESS_ADMIN_ID;
+}
+
+function accessCodeTable(database) {
+  if (!database.accessCodes || typeof database.accessCodes !== 'object' || Array.isArray(database.accessCodes)) {
+    database.accessCodes = {};
+  }
+  return database.accessCodes;
+}
+
+// Models the bot last synced from upstream (data/models.json) plus the pinned ones, or null
+// when that list is not available here (then only the model family is checked).
+function knownModelKeys() {
+  try {
+    const cache = JSON.parse(fs.readFileSync(modelCachePath, 'utf8'));
+    if (!Array.isArray(cache.models) || !cache.models.length) return null;
+    return new Set([...cache.models, ...Object.keys(PINNED_MODELS)].map(accessModelKey));
+  } catch (_) {
+    return null;
+  }
+}
+
+function normalizeAccessModels(models) {
+  const list = Array.isArray(models) ? models : [models];
+  const keys = [...new Set(list.map(accessModelKey).filter(Boolean))];
+  if (!keys.length) throw new Error('Choose at least one model');
+  if (keys.length > MAX_ACCESS_MODELS) throw new Error(`At most ${MAX_ACCESS_MODELS} models per access code`);
+  const known = knownModelKeys();
+  for (const key of keys) {
+    if (!ACCESS_MODEL_NAME.test(key) || !getModelFamily(key)) throw new Error(`Unsupported model: ${key.slice(0, 100)}`);
+    if (known && !known.has(key)) throw new Error(`Unknown model: ${key}. Resync the model list and try again.`);
+  }
+  return keys.sort();
+}
+
+function parseAccessTime(value, label) {
+  const time = typeof value === 'number' ? value : Date.parse(value);
+  if (!Number.isFinite(time)) throw new Error(`Invalid ${label} time`);
+  return time;
+}
+
+function isoTime(time) {
+  return new Date(time).toISOString();
+}
+
+function accessGrantStatus(grant, now = Date.now()) {
+  if (grant.revokedAt) return 'revoked';
+  const start = Date.parse(grant.startsAt);
+  const end = Date.parse(grant.endsAt);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || now >= end) return 'ended';
+  if (now < start) return 'scheduled';
+  return 'active';
+}
+
+function isGrantOpen(grant, now) {
+  const status = accessGrantStatus(grant, now);
+  return status === 'active' || status === 'scheduled';
+}
+
+function validGrants(user) {
+  return (Array.isArray(user?.modelAccess) ? user.modelAccess : [])
+    .filter((grant) => grant && typeof grant.code === 'string' && Array.isArray(grant.models));
+}
+
+// What the user's redeemed access codes mean at `now`. Pure (no file access), so
+// server.js can run it on the user record it already has for every request.
+// `restricted` false = normal model access. While true, only `allowedModels` may be used.
+function modelAccessFor(user, now = Date.now()) {
+  const grants = validGrants(user).map((grant) => ({
+    code: grant.code,
+    models: grant.models.map(accessModelKey).filter(Boolean),
+    startsAt: grant.startsAt,
+    endsAt: grant.endsAt,
+    redeemedAt: grant.redeemedAt || null,
+    status: accessGrantStatus(grant, now),
+  }));
+  const active = grants.filter((grant) => grant.status === 'active')
+    .sort((a, b) => Date.parse(a.endsAt) - Date.parse(b.endsAt));
+  const scheduled = grants.filter((grant) => grant.status === 'scheduled')
+    .sort((a, b) => Date.parse(a.startsAt) - Date.parse(b.startsAt));
+  const allowedModels = active.length ? [...new Set(active.flatMap((grant) => grant.models))].sort() : null;
+  return {
+    restricted: active.length > 0,
+    allowedModels,
+    // The current restriction lasts at least until the last active grant ends.
+    restrictedUntil: active.length ? active[active.length - 1].endsAt : null,
+    active,
+    scheduled,
+  };
+}
+
+function getModelAccess(telegramId) {
+  return modelAccessFor(getUser(telegramId));
+}
+
+function pruneGrants(grants, now) {
+  const finished = grants.filter((grant) => !isGrantOpen(grant, now))
+    .sort((a, b) => String(b.revokedAt || b.endsAt).localeCompare(String(a.revokedAt || a.endsAt)))
+    .slice(0, MAX_ACCESS_GRANT_HISTORY);
+  return grants.filter((grant) => isGrantOpen(grant, now) || finished.includes(grant));
+}
+
+// available | expired | disabled (never redeemed) or in_use | scheduled | finished | revoked.
+function accessCodeStatus(entry, now = Date.now()) {
+  const redemption = entry.redemption;
+  if (redemption) {
+    const status = accessGrantStatus(redemption, now);
+    if (status === 'revoked') return 'revoked';
+    if (status === 'active') return 'in_use';
+    return status === 'scheduled' ? 'scheduled' : 'finished';
+  }
+  if (entry.active === false) return 'disabled';
+  if (!(now < Date.parse(entry.expiresAt))) return 'expired';
+  return 'available';
+}
+
+// A copy for callers, with the computed status and the redeemer's name.
+function accessCodeSummary(entry, users = {}, now = Date.now()) {
+  const redemption = entry.redemption ? { ...entry.redemption } : null;
+  if (redemption) {
+    const user = users[redemption.telegramId];
+    redemption.firstName = user?.firstName || '';
+    redemption.username = user?.username || '';
+  }
+  return {
+    code: entry.code,
+    models: Array.isArray(entry.models) ? [...entry.models] : [],
+    kind: entry.kind,
+    durationMs: entry.durationMs ?? null,
+    startsAt: entry.startsAt ?? null,
+    endsAt: entry.endsAt ?? null,
+    expiresAt: entry.expiresAt,
+    createdAt: entry.createdAt,
+    createdBy: entry.createdBy || '',
+    disabledAt: entry.disabledAt || null,
+    status: accessCodeStatus(entry, now),
+    redemption,
+  };
+}
+
+// Admin only. `kind` 'duration' needs `durationMs` (+ optional `expiresAt` redeem deadline);
+// 'range' needs `endsAt` (+ optional `startsAt`, missing or past = now). Throws a readable
+// reason when anything is not acceptable; nothing the caller sends is trusted.
+function createAccessCode({ models, kind, durationMs, startsAt, endsAt, expiresAt, createdBy } = {}) {
+  if (!isAccessAdmin(createdBy)) throw new Error('Only the admin can create model access codes');
+  const modelKeys = normalizeAccessModels(models);
+  const now = Date.now();
+  const period = { kind, durationMs: null, startsAt: null, endsAt: null, expiresAt: null };
+  if (kind === 'duration') {
+    const duration = Number(durationMs);
+    if (!Number.isSafeInteger(duration) || duration < MIN_ACCESS_PERIOD_MS) throw new Error('The access period must be at least 1 minute');
+    if (duration > MAX_ACCESS_PERIOD_MS) throw new Error('The access period can be at most 365 days');
+    const deadline = expiresAt === undefined || expiresAt === null || expiresAt === ''
+      ? now + DEFAULT_ACCESS_REDEEM_WINDOW_MS
+      : parseAccessTime(expiresAt, 'redeem deadline');
+    if (deadline - now < MIN_ACCESS_PERIOD_MS) throw new Error('The redeem deadline must be at least 1 minute from now');
+    if (deadline - now > MAX_ACCESS_AHEAD_MS) throw new Error('The redeem deadline can be at most 365 days ahead');
+    period.durationMs = duration;
+    period.expiresAt = isoTime(deadline);
+  } else if (kind === 'range') {
+    const start = startsAt ? Math.max(now, parseAccessTime(startsAt, 'start')) : now;
+    if (start - now > MAX_ACCESS_AHEAD_MS) throw new Error('The start time can be at most 365 days ahead');
+    if (endsAt === undefined || endsAt === null || endsAt === '') throw new Error('Set the end time of the access period');
+    const end = parseAccessTime(endsAt, 'end');
+    if (end - start < MIN_ACCESS_PERIOD_MS) throw new Error('The end time must be at least 1 minute after the start');
+    if (end - start > MAX_ACCESS_PERIOD_MS) throw new Error('The access period can be at most 365 days');
+    period.startsAt = isoTime(start);
+    period.endsAt = isoTime(end);
+    period.expiresAt = period.endsAt;
+  } else {
+    throw new Error('Choose how the access period is counted (duration or fixed range)');
+  }
+  return mutateDatabase((database) => {
+    const codes = accessCodeTable(database);
+    let code;
+    do {
+      code = `MDL-${crypto.randomBytes(3).toString('hex').toUpperCase()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+    } while (codes[code]);
+    const entry = {
+      code,
+      models: modelKeys,
+      ...period,
+      active: true,
+      redemption: null,
+      createdAt: isoTime(now),
+      createdBy: String(createdBy).trim(),
+    };
+    codes[code] = entry;
+    return accessCodeSummary(entry, database.users || {}, now);
+  });
+}
+
+// Atomic: checks, the user's grant and the code's redemption are written under one lock,
+// so a code can never be redeemed twice. Answers { ok: false, reason } with reason
+// not_found | already_redeemed | used | disabled | expired, or { ok: true, ... }.
+function redeemAccessCode(telegramId, rawCode, profile = {}) {
+  const code = normalizeRedeemCode(rawCode);
+  if (!ACCESS_CODE_PATTERN.test(code)) return { ok: false, reason: 'not_found' };
+  return mutateDatabase((database) => {
+    const id = String(telegramId);
+    const entry = accessCodeTable(database)[code];
+    if (!entry) return { ok: false, reason: 'not_found' };
+    if (entry.redemption) return { ok: false, reason: entry.redemption.telegramId === id ? 'already_redeemed' : 'used' };
+    if (entry.active === false) return { ok: false, reason: 'disabled' };
+    const now = Date.now();
+    if (!(now < Date.parse(entry.expiresAt))) return { ok: false, reason: 'expired' };
+    const start = entry.kind === 'range' ? Math.max(now, Date.parse(entry.startsAt)) : now;
+    const end = entry.kind === 'range' ? Date.parse(entry.endsAt) : now + Number(entry.durationMs);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return { ok: false, reason: 'expired' };
+
+    const user = database.users[id] || newUser(id, profile);
+    database.users[id] = user;
+    const at = isoTime(now);
+    const grant = { code, models: [...entry.models], startsAt: isoTime(start), endsAt: isoTime(end), redeemedAt: at };
+    user.modelAccess = pruneGrants([...validGrants(user), grant], now);
+    entry.redemption = { telegramId: id, at, startsAt: grant.startsAt, endsAt: grant.endsAt };
+    return {
+      ok: true,
+      code,
+      models: grant.models,
+      kind: entry.kind,
+      startsAt: grant.startsAt,
+      endsAt: grant.endsAt,
+      status: accessGrantStatus(grant, now),
+      access: modelAccessFor(user, now),
+    };
+  });
+}
+
+// Newest first.
+function listAccessCodes(limit = 10) {
+  const database = readDatabase();
+  const now = Date.now();
+  return Object.values(database.accessCodes || {})
+    .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
+    .slice(0, Math.max(1, Number(limit) || 10))
+    .map((entry) => accessCodeSummary(entry, database.users || {}, now));
+}
+
+function getAccessCode(rawCode) {
+  const database = readDatabase();
+  const entry = (database.accessCodes || {})[normalizeRedeemCode(rawCode)];
+  return entry ? accessCodeSummary(entry, database.users || {}) : null;
+}
+
+// Admin only. A code nobody redeemed yet can no longer be redeemed; a redeemed code whose
+// period is still running (or waiting to start) ends now, so that user's model access is
+// back to normal at once. Null = no such code; { changed: false } = nothing left to stop.
+function disableAccessCode(rawCode, disabledBy) {
+  if (!isAccessAdmin(disabledBy)) throw new Error('Only the admin can disable model access codes');
+  const code = normalizeRedeemCode(rawCode);
+  return mutateDatabase((database) => {
+    const entry = accessCodeTable(database)[code];
+    if (!entry) return null;
+    const now = Date.now();
+    const previousStatus = accessCodeStatus(entry, now);
+    if (!['available', 'in_use', 'scheduled'].includes(previousStatus)) {
+      return { changed: false, previousStatus, code: accessCodeSummary(entry, database.users || {}, now) };
+    }
+    const at = isoTime(now);
+    entry.active = false;
+    entry.disabledAt = at;
+    entry.disabledBy = String(disabledBy).trim();
+    if (entry.redemption) {
+      entry.redemption.revokedAt = at;
+      const user = database.users[entry.redemption.telegramId];
+      for (const grant of validGrants(user)) {
+        if (grant.code === code && !grant.revokedAt) grant.revokedAt = at;
+      }
+    }
+    return { changed: true, previousStatus, code: accessCodeSummary(entry, database.users || {}, now) };
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Referrals: every user gets a code for the link t.me/<bot>?start=<code>. When a
 // NEW user (no account yet) starts the bot with someone's code, the inviter is
 // credited with bonus tokens. Abuse guards, all checked under the DB lock:
@@ -473,6 +788,9 @@ function getAdminStats() {
     activeRedeemCodes: 0,
     redemptions: 0,
     redeemedAmount: 0,
+    accessCodes: 0,
+    accessCodesAvailable: 0,
+    accessCodesInUse: 0,
     last24h: { requests: 0, errors: 0, avgMs: 0 },
     referralInvites: 0,
     referralRewarded: 0,
@@ -518,6 +836,14 @@ function getAdminStats() {
     if (entry.active !== false && used < entry.maxUses) stats.activeRedeemCodes += 1;
     stats.redemptions += used;
     stats.redeemedAmount += used * Number(entry.amount || 0);
+  }
+
+  const now = Date.now();
+  for (const entry of Object.values(database.accessCodes || {})) {
+    const status = accessCodeStatus(entry, now);
+    stats.accessCodes += 1;
+    if (status === 'available') stats.accessCodesAvailable += 1;
+    if (status === 'in_use' || status === 'scheduled') stats.accessCodesInUse += 1;
   }
 
   let durationTotal = 0;
@@ -1044,6 +1370,8 @@ function clearModerationBlocks() {
 }
 
 module.exports = { ensureUser, setUserLanguage, SUPPORTED_LANGUAGES, createApiKey, findUserByApiKey, recordUsage, getUser, getAllUsers, recordAdminRequest, getAdminLogs, addBalance, adjustBalance, getOrder, revokeApiKey, createOrder, settleOrder, createRedeemCode, redeemCode, listRedeemCodes, disableRedeemCode, normalizeRedeemCode, getAdminStats, resetStats, databasePath,
+  createAccessCode, redeemAccessCode, listAccessCodes, getAccessCode, disableAccessCode, getModelAccess, modelAccessFor,
+  ACCESS_CODE_PATTERN, MAX_ACCESS_MODELS, MAX_ACCESS_PERIOD_MS, MAX_ACCESS_AHEAD_MS, DEFAULT_ACCESS_REDEEM_WINDOW_MS,
   getReferralInfo, startWithReferral,
   createTicket, addTicketMessage, linkAdminMessage, findTicketByAdminMessage, getTicket, getOpenTicketForUser, listTickets, countOpenTickets, closeTicket,
   createPoll, votePoll, getPoll, listPolls, closePoll, setPollSent,
