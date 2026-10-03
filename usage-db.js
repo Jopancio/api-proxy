@@ -802,7 +802,6 @@ function setPollSent(pollId, sent) {
 // Newest first per user. A prompt equal to the user's latest one (coding agents resend the same
 // question with every tool call) bumps `repeats` instead of taking another slot.
 const promptLogPath = path.join(path.dirname(databasePath), 'prompts.json');
-const promptLockPath = `${promptLogPath}.lock`;
 const MAX_PROMPTS_PER_USER = 10;
 const MAX_PROMPT_CHARS = 1000;
 const MAX_PROMPT_USERS = 200; // the least recently active users beyond this are dropped
@@ -826,30 +825,36 @@ function readPromptLog() {
   return { users: {} };
 }
 
-function mutatePromptLog(mutator) {
-  fs.mkdirSync(path.dirname(promptLogPath), { recursive: true });
+// Locked, atomic read-modify-write of a small JSON side file (prompts.json, moderation.json).
+function mutateLockedJson(filePath, read, mutator) {
+  const fileLockPath = `${filePath}.lock`;
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
   let lockHandle;
   for (let attempt = 0; attempt < 400; attempt += 1) {
     try {
-      lockHandle = fs.openSync(promptLockPath, 'wx');
+      lockHandle = fs.openSync(fileLockPath, 'wx');
       break;
     } catch (error) {
       if (error.code !== 'EEXIST') throw error;
       waitBriefly();
     }
   }
-  if (!lockHandle) throw new Error('Prompt log is busy; try again');
+  if (!lockHandle) throw new Error(`${path.basename(filePath)} is busy; try again`);
   try {
-    const log = readPromptLog();
-    const result = mutator(log);
-    const temporaryPath = `${promptLogPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
-    fs.writeFileSync(temporaryPath, JSON.stringify(log), 'utf8');
-    fs.renameSync(temporaryPath, promptLogPath);
+    const data = read();
+    const result = mutator(data);
+    const temporaryPath = `${filePath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+    fs.writeFileSync(temporaryPath, JSON.stringify(data), 'utf8');
+    fs.renameSync(temporaryPath, filePath);
     return result;
   } finally {
     fs.closeSync(lockHandle);
-    fs.unlinkSync(promptLockPath);
+    fs.unlinkSync(fileLockPath);
   }
+}
+
+function mutatePromptLog(mutator) {
+  return mutateLockedJson(promptLogPath, readPromptLog, mutator);
 }
 
 function lastPromptActivity(list) {
@@ -944,8 +949,103 @@ function clearAllPrompts() {
   });
 }
 
+// ---------- AI moderation log (Admin Panel -> Moderation) ----------
+// Written by server.js: one entry per prompt the moderator rejected, plus running counters.
+// file = { blocked: [ { id, at, telegramId, model, endpoint, category, reason, text, chars } ],
+//          stats: { since, checked, blocked, errors, lastError, lastErrorAt } }   (newest first)
+const moderationLogPath = path.join(path.dirname(databasePath), 'moderation.json');
+const MAX_MODERATION_ENTRIES = 100;
+const MAX_MODERATION_TEXT = 2000;
+
+function emptyModerationStats() {
+  return { since: new Date().toISOString(), checked: 0, blocked: 0, errors: 0, lastError: '', lastErrorAt: null };
+}
+
+function readModerationLog() {
+  try {
+    const log = JSON.parse(fs.readFileSync(moderationLogPath, 'utf8'));
+    if (log && Array.isArray(log.blocked)) {
+      log.stats = { ...emptyModerationStats(), ...(log.stats && typeof log.stats === 'object' ? log.stats : {}) };
+      return log;
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') console.error('[moderation] unreadable moderation.json, starting a new one:', error.message);
+  }
+  return { blocked: [], stats: emptyModerationStats() };
+}
+
+// Saves one rejected prompt. `entry` = { telegramId, model, endpoint, category, reason, text }.
+function recordModerationBlock(entry = {}) {
+  const raw = String(entry.text || '').trim();
+  return mutateLockedJson(moderationLogPath, readModerationLog, (log) => {
+    const taken = new Set(log.blocked.map((item) => item.id));
+    let id;
+    do {
+      id = crypto.randomBytes(4).toString('hex');
+    } while (taken.has(id));
+    const saved = {
+      id,
+      at: new Date().toISOString(),
+      telegramId: String(entry.telegramId || ''),
+      model: String(entry.model || ''),
+      endpoint: String(entry.endpoint || ''),
+      category: String(entry.category || 'other').slice(0, 40),
+      reason: String(entry.reason || '').slice(0, 300),
+      text: clipText(raw, MAX_MODERATION_TEXT),
+      chars: raw.length,
+    };
+    log.blocked = [saved, ...log.blocked].slice(0, MAX_MODERATION_ENTRIES);
+    log.stats.blocked = Number(log.stats.blocked || 0) + 1;
+    return saved;
+  });
+}
+
+// Adds to the counters. `delta` = { checked?, errors?, lastError? }.
+function addModerationStats(delta = {}) {
+  return mutateLockedJson(moderationLogPath, readModerationLog, (log) => {
+    log.stats.checked = Number(log.stats.checked || 0) + Math.max(0, Number(delta.checked) || 0);
+    log.stats.errors = Number(log.stats.errors || 0) + Math.max(0, Number(delta.errors) || 0);
+    if (delta.lastError) {
+      log.stats.lastError = String(delta.lastError).slice(0, 300);
+      log.stats.lastErrorAt = new Date().toISOString();
+    }
+    return { ...log.stats };
+  });
+}
+
+function withUserNames(entry, users) {
+  const user = users[entry.telegramId];
+  return { ...entry, firstName: user?.firstName || '', username: user?.username || '' };
+}
+
+// { stats, total, entries: newest `limit` blocked prompts with the users' names }.
+function listModerationBlocks(limit = 20) {
+  const log = readModerationLog();
+  const users = readDatabase().users || {};
+  const count = Math.max(0, Math.min(Number(limit) || 0, MAX_MODERATION_ENTRIES));
+  return { stats: log.stats, total: log.blocked.length, entries: log.blocked.slice(0, count).map((entry) => withUserNames(entry, users)) };
+}
+
+// One blocked prompt by id, or null.
+function getModerationBlock(id) {
+  const entry = readModerationLog().blocked.find((item) => item.id === String(id || '').trim().toLowerCase());
+  return entry ? withUserNames(entry, readDatabase().users || {}) : null;
+}
+
+// Deletes the stored blocked prompts and resets the counters. Returns how many were removed.
+function clearModerationBlocks() {
+  if (!fs.existsSync(moderationLogPath)) return 0;
+  return mutateLockedJson(moderationLogPath, readModerationLog, (log) => {
+    const removed = log.blocked.length;
+    log.blocked = [];
+    log.stats = emptyModerationStats();
+    return removed;
+  });
+}
+
 module.exports = { ensureUser, setUserLanguage, SUPPORTED_LANGUAGES, createApiKey, findUserByApiKey, recordUsage, getUser, getAllUsers, recordAdminRequest, getAdminLogs, addBalance, adjustBalance, getOrder, revokeApiKey, createOrder, settleOrder, createRedeemCode, redeemCode, listRedeemCodes, disableRedeemCode, normalizeRedeemCode, getAdminStats, resetStats, databasePath,
   getReferralInfo, startWithReferral,
   createTicket, addTicketMessage, linkAdminMessage, findTicketByAdminMessage, getTicket, getOpenTicketForUser, listTickets, countOpenTickets, closeTicket,
   createPoll, votePoll, getPoll, listPolls, closePoll, setPollSent,
-  recordPrompt, listPromptUsers, getUserPrompts, clearPrompts, clearAllPrompts, promptLogPath };
+  recordPrompt, listPromptUsers, getUserPrompts, clearPrompts, clearAllPrompts, promptLogPath,
+  recordModerationBlock, addModerationStats, listModerationBlocks, getModerationBlock, clearModerationBlocks, moderationLogPath };

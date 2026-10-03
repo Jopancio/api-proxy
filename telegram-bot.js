@@ -15,6 +15,7 @@ const {
   getDisabledModels, setModelDisabled, setFamilyDisabled,
   getRateLimits, setModelRateLimit, setFamilyRateLimit,
   listBansos, createBansos, stopBansos,
+  getModerationSettings, setModerationSettings, listModerationBlocks, getModerationBlock, clearModerationBlocks,
   getReferralInfo, startWithReferral, getReferralSettings, setReferralSettings,
   saveModelCache, dataMode,
 } = require('./data-client');
@@ -273,6 +274,11 @@ async function adminKeyboard() {
       // An outdated API server without this feature simply reads as OFF.
       text: `\u{1F4AC} Recent Prompts (${await isPromptLogEnabled().then((on) => (on ? 'ON' : 'OFF'), () => 'OFF')})`,
       callback_data: 'admin_prompts',
+    }],
+    [{
+      // An outdated API server without this feature reads as OFF (and the screen explains why).
+      text: `\u{1F6E1}\u{FE0F} AI Moderation (${await getModerationSettings().then((settings) => (settings.enabled ? 'ON' : 'OFF'), () => 'OFF')})`,
+      callback_data: 'admin_mod',
     }],
     // Balance & codes
     [{ text: '\u{1F39F}\u{FE0F} Redeem Codes', callback_data: 'admin_redeem' }, { text: '\u{1F4B3} Top Up User', callback_data: 'admin_topup' }],
@@ -2165,6 +2171,103 @@ async function handlePromptsAction(query, action) {
   return showAdminView(query, await adminPromptsView());
 }
 
+// --- AI moderation --------------------------------------------------------
+// Admin Panel -> AI Moderation. server.js asks our upstream checker model (MODERATION_MODEL) about
+// every request for a moderated family before forwarding it, rejects cyber abuse / ToS violations
+// and saves them in data/moderation.json (moderation.js). Alerts per blocked prompt are sent by
+// server.js with this bot's token; their buttons (admin_mod, admin_mod_n_<id>) land here.
+// Prompt texts and names are user input: always escaped.
+const MODERATION_ENTRIES_SHOWN = 10;
+const MODERATION_ID = /^[a-f0-9]{8}$/;
+
+function moderationUserLabel(entry) {
+  const name = entry.firstName || (entry.username ? `@${entry.username}` : `ID ${entry.telegramId || '?'}`);
+  return entry.firstName && entry.username ? `${name} (@${entry.username})` : name;
+}
+
+async function adminModerationView(notice = '') {
+  const settings = await getModerationSettings();
+  const log = await listModerationBlocks(MODERATION_ENTRIES_SHOWN);
+  const stats = log.stats || {};
+  const families = settings.families.join(', ') || '-';
+  const lines = [
+    ...(notice ? [notice, ''] : []),
+    `\u{1F6E1}\u{FE0F} <b>AI Moderation</b> \u{2014} ${settings.enabled ? '\u{1F7E2} ON' : '\u{1F534} OFF'}`,
+    `Checker: <code>${escapeHtml(settings.model)}</code>`,
+    `Families: <b>${escapeHtml(families)}</b> \u{2022} Alerts: ${settings.notify ? '\u{1F514} ON' : '\u{1F515} OFF'}`,
+    '',
+    `<blockquote>Every ${escapeHtml(families)} request is checked by our AI before it is forwarded. Prompts flagged as cyber abuse or a ToS violation are rejected (HTTP 400) and not billed. If the checker fails or times out, the request goes through (fail-open) and the error is counted below.</blockquote>`,
+    `\u{1F4CA} Since ${escapeHtml(wibTime(stats.since))}: checked <b>${formatTokens(stats.checked)}</b> \u{2022} blocked <b>${formatTokens(stats.blocked)}</b> \u{2022} checker errors <b>${formatTokens(stats.errors)}</b>`,
+  ];
+  if (stats.lastError) lines.push(`\u{26A0}\u{FE0F} Last error (${escapeHtml(wibTime(stats.lastErrorAt))}): <code>${escapeHtml(clipChars(stats.lastError, 160))}</code>`);
+  lines.push('', `<b>Recently blocked (${formatTokens(log.total)})</b>`);
+  if (!log.entries.length) lines.push('Nothing blocked yet.');
+  log.entries.forEach((entry, index) => {
+    lines.push(`${index + 1}. <b>${escapeHtml(clipChars(moderationUserLabel(entry), 32))}</b> \u{2022} ${escapeHtml(wibTime(entry.at))} \u{2022} <code>${escapeHtml(entry.model)}</code> \u{2022} ${escapeHtml(entry.category)}\n`
+      + `   \u{21B3} <i>${escapeHtml(clipChars(String(entry.text || '').replace(/\s+/g, ' ').trim(), PROMPT_PREVIEW_LENGTH))}</i>`);
+  });
+  const entryButtons = log.entries.map((entry, index) => ({ text: `${index + 1}. ${clipChars(moderationUserLabel(entry), 22)}`, callback_data: `admin_mod_v_${entry.id}` }));
+  const rows = [];
+  for (let i = 0; i < entryButtons.length; i += 2) rows.push(entryButtons.slice(i, i + 2));
+  rows.push([
+    settings.enabled ? { text: '\u{1F534} Turn OFF', callback_data: 'admin_mod_off' } : { text: '\u{1F7E2} Turn ON', callback_data: 'admin_mod_on' },
+    settings.notify ? { text: '\u{1F515} Alerts OFF', callback_data: 'admin_mod_alert_off' } : { text: '\u{1F514} Alerts ON', callback_data: 'admin_mod_alert_on' },
+  ]);
+  if (log.total || Number(stats.checked) || Number(stats.errors)) rows.push([{ text: '\u{1F5D1}\u{FE0F} Clear log & counters', callback_data: 'admin_mod_clear' }]);
+  rows.push([{ text: '\u{1F504} Refresh', callback_data: 'admin_mod_list' }, { text: '\u{1F519} Back to admin panel', callback_data: 'admin_panel' }]);
+  return { text: lines.join('\n'), reply_markup: { inline_keyboard: rows } };
+}
+
+async function adminModerationBlockView(id) {
+  const entry = MODERATION_ID.test(id) ? await getModerationBlock(id) : null;
+  if (!entry) return adminModerationView('That blocked prompt is no longer stored.');
+  const lines = [
+    `\u{1F6E1}\u{FE0F} <b>Blocked prompt</b> <code>#${escapeHtml(entry.id)}</code>`,
+    `\u{1F464} ${escapeHtml(clipChars(moderationUserLabel(entry), 60))} \u{2022} ID <code>${escapeHtml(entry.telegramId)}</code>`,
+    `\u{1F552} ${escapeHtml(wibTime(entry.at))} \u{2022} <code>${escapeHtml(entry.model)}</code> \u{2022} <code>${escapeHtml(entry.endpoint)}</code>`,
+    `\u{1F3F7}\u{FE0F} Category: <b>${escapeHtml(entry.category)}</b>`,
+    ...(entry.reason ? [`\u{1F4DD} ${escapeHtml(entry.reason)}`] : []),
+    `<blockquote expandable>${escapeHtml(clipChars(entry.text, 2500))}</blockquote>`,
+    ...(Number(entry.chars) > Array.from(String(entry.text || '')).length ? [`<i>${formatTokens(entry.chars)} characters in total; the start is stored.</i>`] : []),
+  ];
+  return { text: lines.join('\n'), reply_markup: { inline_keyboard: [
+    [{ text: '\u{1F519} AI Moderation', callback_data: 'admin_mod_list' }],
+  ] } };
+}
+
+// Every admin_mod* button (admin-only: checked for every admin_ action before this runs).
+async function handleModerationAction(query, action) {
+  const chatId = query.message.chat.id;
+  const sendNew = (view) => telegram('sendMessage', { chat_id: chatId, text: view.text, parse_mode: 'HTML', reply_markup: view.reply_markup });
+  // From the admin panel or an alert: a new message, so the panel / alert stays as it was.
+  if (action === 'admin_mod') return sendNew(await adminModerationView());
+  if (action.startsWith('admin_mod_n_')) return sendNew(await adminModerationBlockView(action.slice('admin_mod_n_'.length)));
+  if (action.startsWith('admin_mod_v_')) return showAdminView(query, await adminModerationBlockView(action.slice('admin_mod_v_'.length)));
+  if (action === 'admin_mod_on' || action === 'admin_mod_off') {
+    const settings = await setModerationSettings({ enabled: action === 'admin_mod_on' });
+    return showAdminView(query, await adminModerationView(settings.enabled
+      ? '\u{1F7E2} Moderation is ON. New requests are checked before they are forwarded.'
+      : '\u{1F534} Moderation is OFF. Requests are forwarded without a check.'));
+  }
+  if (action === 'admin_mod_alert_on' || action === 'admin_mod_alert_off') {
+    const settings = await setModerationSettings({ notify: action === 'admin_mod_alert_on' });
+    return showAdminView(query, await adminModerationView(settings.notify
+      ? '\u{1F514} You will get a message for every blocked prompt.'
+      : '\u{1F515} Alerts are off. Blocked prompts are still saved here.'));
+  }
+  if (action === 'admin_mod_clear') {
+    return showAdminView(query, confirmView(
+      '\u{1F5D1}\u{FE0F} Delete every stored blocked prompt and reset the moderation counters? This cannot be undone.',
+      'admin_mod_clear_yes', 'admin_mod_list',
+    ));
+  }
+  if (action === 'admin_mod_clear_yes') {
+    const removed = await clearModerationBlocks();
+    return showAdminView(query, await adminModerationView(`\u{1F5D1}\u{FE0F} Deleted ${formatTokens(removed)} blocked prompt(s) and reset the counters.`));
+  }
+  return showAdminView(query, await adminModerationView());
+}
+
 // Toggle screens edit the same message instead of posting a new one per tap.
 async function showAdminView(query, view) {
   try {
@@ -2275,6 +2378,13 @@ async function handleCallbackQuery(query) {
       return await handlePromptsAction(query, action);
     } catch (error) {
       return telegram('sendMessage', { chat_id: chatId, text: `\u{274C} Recent Prompts: ${escapeHtml(error.message)}`, parse_mode: 'HTML', reply_markup: adminBackKeyboard() });
+    }
+  }
+  if (action === 'admin_mod' || action.startsWith('admin_mod_')) {
+    try {
+      return await handleModerationAction(query, action);
+    } catch (error) {
+      return telegram('sendMessage', { chat_id: chatId, text: `\u{274C} AI Moderation: ${escapeHtml(error.message)}`, parse_mode: 'HTML', reply_markup: adminBackKeyboard() });
     }
   }
   if (action === 'admin_poll' || action.startsWith('admin_poll_')) {

@@ -11,6 +11,7 @@ const usageDb = require('./usage-db');
 const adminSettings = require('./admin-settings');
 const { PINNED_MODELS, getModelFamily, stripModelPrefix } = require('./pricing');
 const { isAllModelsFree } = require('./admin-settings');
+const moderation = require('./moderation');
 
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = Number(process.env.PORT || 8080);
@@ -118,6 +119,11 @@ const INTERNAL_FUNCTIONS = {
   listBansos: adminSettings.listBansos,
   createBansos: adminSettings.createBansos,
   stopBansos: adminSettings.stopBansos,
+  getModerationSettings: adminSettings.getModerationSettings,
+  setModerationSettings: adminSettings.setModerationSettings,
+  listModerationBlocks: usageDb.listModerationBlocks,
+  getModerationBlock: usageDb.getModerationBlock,
+  clearModerationBlocks: usageDb.clearModerationBlocks,
   // The bot syncs the model list; the proxy needs its aliases to route requests.
   saveModelCache: (cache) => {
     fs.mkdirSync(path.dirname(modelCachePath), { recursive: true });
@@ -581,6 +587,67 @@ app.use('/v1', (req, res, next) => {
     console.error('[prompts] skipped:', error.message);
   }
   return next();
+});
+
+// ---------- AI moderation (bot: Admin Panel -> Moderation) ----------
+// Generation requests for a moderated family (ChatGPT by default) are checked by our own upstream
+// model first: cyber abuse / ToS violations are rejected with HTTP 400 and never reach the model,
+// so they are not billed. Analysed: the latest user message plus the client's system/developer
+// instructions. Fail-open: when the checker fails the request goes through (see moderation.js).
+function extractInstructions(body) {
+  if (!body || typeof body !== 'object') return '';
+  const parts = [];
+  if (typeof body.system === 'string' || Array.isArray(body.system)) parts.push(contentText(body.system)); // Anthropic
+  if (typeof body.instructions === 'string') parts.push(body.instructions); // Responses API
+  const items = Array.isArray(body.messages) ? body.messages : (Array.isArray(body.input) ? body.input : []);
+  for (const item of items) {
+    if (item && (item.role === 'system' || item.role === 'developer')) parts.push(contentText(item.content));
+  }
+  return parts.map((part) => String(part || '').trim()).filter(Boolean).join('\n\n');
+}
+
+app.use('/v1', async (req, res, next) => {
+  if (req.method !== 'POST' || !req.userRecord || !PROMPT_ENDPOINTS.test(req.path)) return next();
+  let settings;
+  let userText = '';
+  try {
+    settings = moderation.moderationFor(req.body && req.body.model);
+    if (settings) userText = extractPromptText(req.body);
+  } catch (error) {
+    console.error('[moderation] skipped:', error.message);
+    return next();
+  }
+  if (!settings || !userText) return next();
+
+  const model = stripModelPrefix(req.body.model);
+  const endpoint = `${req.baseUrl}${req.path}`;
+  const result = await moderation.checkPrompt(
+    { userText, instructions: extractInstructions(req.body) },
+    settings,
+    { baseUrl: UPSTREAM_BASE_URL, apiKey: API_KEY },
+  );
+  // The client may have hung up while the prompt was being checked.
+  if (res.headersSent || res.destroyed) return undefined;
+  if (result.verdict === 'error') {
+    console.error(`[moderation] check failed, request allowed (fail-open): user ${req.userRecord.telegramId} ${model}: ${result.error}`);
+    return next();
+  }
+  if (result.verdict !== 'block') return next();
+
+  console.warn(`[moderation] BLOCKED user ${req.userRecord.telegramId} ${model} [${result.category}]${result.cached ? ' (cached)' : ''}: ${result.reason}`);
+  if (!result.cached) {
+    moderation.reportBlock({ user: req.userRecord, model, endpoint, verdict: result, text: userText, settings });
+  }
+  // OpenAI clients read error.message/code; Anthropic clients read type + error.type.
+  return res.status(400).json({
+    type: 'error',
+    error: {
+      message: `Request rejected by content moderation: this prompt appears to violate the usage policy (${result.category}). Please rephrase your request, or contact support if you think this is a mistake.`,
+      type: 'invalid_request_error',
+      code: 'content_policy_violation',
+      param: null,
+    },
+  });
 });
 
 function resolveUpstreamModel(model) {

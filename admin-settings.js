@@ -64,6 +64,36 @@ function setPromptLogEnabled(enabled) {
   return settings.promptLogEnabled;
 }
 
+// ---------- AI moderation (bot: Admin Panel -> Moderation) ----------
+// server.js asks an upstream model whether a prompt is cyber abuse / a ToS violation before it
+// forwards the request, and rejects it when flagged. ON unless the admin switched it off, and so
+// is the Telegram notification per blocked prompt. The checker model and the moderated families
+// come from the environment of the host running server.js.
+const DEFAULT_MODERATION_MODEL = 'ag/gemini-3.8-flash-low';
+const DEFAULT_MODERATION_FAMILIES = 'ChatGPT';
+
+function getModerationSettings() {
+  const moderation = readSettings().moderation || {};
+  return {
+    enabled: moderation.enabled !== false,
+    notify: moderation.notify !== false,
+    model: String(process.env.MODERATION_MODEL || DEFAULT_MODERATION_MODEL).trim(),
+    families: String(process.env.MODERATION_FAMILIES || DEFAULT_MODERATION_FAMILIES)
+      .split(',').map((family) => family.trim()).filter(Boolean),
+  };
+}
+
+// Partial update: { enabled?, notify? }. Returns the new settings.
+function setModerationSettings(changes = {}) {
+  const settings = readSettings();
+  const moderation = { ...(settings.moderation && typeof settings.moderation === 'object' ? settings.moderation : {}) };
+  if (changes.enabled !== undefined) moderation.enabled = Boolean(changes.enabled);
+  if (changes.notify !== undefined) moderation.notify = Boolean(changes.notify);
+  settings.moderation = moderation;
+  writeSettings(settings);
+  return getModerationSettings();
+}
+
 // ---------- Disabled models ----------
 // Models are stored by display name (without any route prefix such as "1/", "cx/" or "cbcn/"),
 // families by name ("Qwen", "ChatGPT", ...).
@@ -335,6 +365,7 @@ function setReferralSettings(changes = {}) {
 module.exports = {
   readSettings, isAllModelsFree, setAllModelsFree, isPaymentsEnabled, setPaymentsEnabled, setAnnouncement, settingsPath,
   isPromptLogEnabled, setPromptLogEnabled,
+  DEFAULT_MODERATION_MODEL, getModerationSettings, setModerationSettings,
   getDisabledModels, setModelDisabled, setFamilyDisabled, isModelDisabled,
   MAX_RPM, getRateLimits, setModelRateLimit, setFamilyRateLimit, getRateLimitFor,
   MAX_BANSOS_DURATION_MS, MAX_BANSOS_START_AHEAD_MS, listBansos, createBansos, stopBansos, getBansosFor,

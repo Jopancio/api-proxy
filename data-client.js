@@ -27,6 +27,7 @@ const FUNCTION_NAMES = [
   'getDisabledModels', 'setModelDisabled', 'setFamilyDisabled',
   'getRateLimits', 'setModelRateLimit', 'setFamilyRateLimit',
   'listBansos', 'createBansos', 'stopBansos',
+  'getModerationSettings', 'setModerationSettings', 'listModerationBlocks', 'getModerationBlock', 'clearModerationBlocks',
   'saveModelCache',
 ];
 
