@@ -332,10 +332,12 @@ function disableRedeemCode(rawCode) {
 // ---------------------------------------------------------------------------
 // Model access codes (bot: Admin Panel -> Kode Akses Model). The admin binds one or
 // more models and a period to a unique single-use code "MDL-XXXXXX-XXXXXX". The user
-// who redeems it gets a grant: while the grant is active their API keys may ONLY use
-// those models (server.js checks this on every /v1 request). Whether a grant is active
-// is worked out from the clock on every check, so once it ends the user's model access
-// is back to normal by itself; no timer is involved.
+// who redeems it gets a grant: while the grant is active their API keys may use those
+// models even when the admin has disabled them (model or whole family) for everyone
+// else, so a disabled model becomes exclusive to code holders. Every other model stays
+// available exactly as before: a code never blocks anything. server.js checks this on
+// every /v1 request. Whether a grant is active is worked out from the clock on every
+// check, so once it ends the user's model access is back to normal by itself; no timer.
 //
 // Period kinds:
 //   duration  access lasts `durationMs` from the moment of redemption; the code can be
@@ -347,7 +349,7 @@ function disableRedeemCode(rawCode) {
 //   startsAt, endsAt, expiresAt, active, createdAt, createdBy, disabledAt?, disabledBy?,
 //   redemption: null | { telegramId, at, startsAt, endsAt, revokedAt? } } }
 // user.modelAccess = [ { code, models, startsAt, endsAt, redeemedAt, revokedAt? } ]
-// Several active grants of one user add up: the user may use every model of all of them.
+// Several active grants of one user add up: the user gets every model of all of them.
 // Creating and disabling codes is refused here unless the caller is ADMIN_TELEGRAM_ID.
 // ---------------------------------------------------------------------------
 
@@ -436,7 +438,8 @@ function validGrants(user) {
 
 // What the user's redeemed access codes mean at `now`. Pure (no file access), so
 // server.js can run it on the user record it already has for every request.
-// `restricted` false = normal model access. While true, only `allowedModels` may be used.
+// `granted` false = no extra access. While true, `models` (on top of every normally available
+// model) may be used even when the admin has disabled them.
 function modelAccessFor(user, now = Date.now()) {
   const grants = validGrants(user).map((grant) => ({
     code: grant.code,
@@ -450,12 +453,11 @@ function modelAccessFor(user, now = Date.now()) {
     .sort((a, b) => Date.parse(a.endsAt) - Date.parse(b.endsAt));
   const scheduled = grants.filter((grant) => grant.status === 'scheduled')
     .sort((a, b) => Date.parse(a.startsAt) - Date.parse(b.startsAt));
-  const allowedModels = active.length ? [...new Set(active.flatMap((grant) => grant.models))].sort() : null;
   return {
-    restricted: active.length > 0,
-    allowedModels,
-    // The current restriction lasts at least until the last active grant ends.
-    restrictedUntil: active.length ? active[active.length - 1].endsAt : null,
+    granted: active.length > 0,
+    models: [...new Set(active.flatMap((grant) => grant.models))].sort(),
+    // Some extra access lasts at least until the last active grant ends.
+    grantedUntil: active.length ? active[active.length - 1].endsAt : null,
     active,
     scheduled,
   };

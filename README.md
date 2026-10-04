@@ -83,17 +83,18 @@ the models, then one of two period kinds:
   A code redeemed before the start waits for the start.
 
 Users redeem the code with the same **Redeem Code** button or `/redeem <code>`
-as balance codes. While the code is active, the user's API keys can only use the
-code's models: other models get HTTP `403` (`model_not_allowed`), write requests
-without a `model` get `403` (`model_required`), and `/v1/models` only lists the
-allowed models. Several active codes add up. When the period ends the user's
-normal model access comes back by itself (it is worked out from the clock on
-every request). Prices, balance, bonus tokens, BANSOS, disabled models and rate
-limits are unchanged.
+as balance codes. A code only adds access and never blocks anything: while it
+is active, the user can use the code's models even when the admin has disabled
+them (model or whole family) for everyone else, and `/v1/models` lists them for
+that user. Every other model keeps working exactly as for any other user. To
+make a model exclusive, disable it in **Disable Model** and hand out access
+codes for it. Several active codes add up. When the period ends the extra access
+ends by itself (it is worked out from the clock on every request). Prices,
+balance, bonus tokens, BANSOS and rate limits are unchanged.
 
 The admin list shows each code's status (unused, in use, waiting to start,
 finished, expired, disabled, stopped). The admin can disable an unused code, or
-stop a running one, which gives the user normal access again at once. Codes
+stop a running one, which ends the user's extra access at once. Codes
 live in `data/users.json` (`accessCodes`, plus `modelAccess` on the user). The
 data layer refuses to create or disable codes for anyone other than
 `ADMIN_TELEGRAM_ID` (default `6957236291`, set it on both hosts when they are split).
