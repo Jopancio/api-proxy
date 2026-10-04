@@ -645,11 +645,12 @@ function isDisabledIn(disabled, model) {
 // `telegramId` (optional): the asking user, so an active model access code can be pointed out.
 async function modelPriceMessage(telegramId) {
   const access = telegramId ? await getModelAccess(telegramId).catch(() => null) : null;
-  const account = access?.restricted ? await getUser(telegramId).catch(() => null) : null;
-  const notice = access?.restricted ? `${modelAccessNotice(access, userLanguage(account))}\n\n` : '';
+  const account = access?.granted ? await getUser(telegramId).catch(() => null) : null;
+  const notice = access?.granted ? `${modelAccessNotice(access, userLanguage(account))}\n\n` : '';
+  const unlocked = new Set(access?.granted ? access.models : []);
   const disabled = await getDisabledModels();
-  // Users only see models they can actually use.
-  const models = (await syncSupportedModels()).filter((model) => !isDisabledIn(disabled, model));
+  // Users only see models they can actually use: disabled ones only while their access code unlocks them.
+  const models = (await syncSupportedModels()).filter((model) => !isDisabledIn(disabled, model) || unlocked.has(model.toLowerCase()));
   const allFree = await isAllModelsFree();
   // Active BANSOS windows; an outdated API server simply has none.
   const bansos = allFree ? [] : (await listBansos().catch(() => [])).filter((entry) => entry.status === 'active');
@@ -1085,7 +1086,7 @@ async function adminModelFamiliesView() {
   const text = [
     '\u{1F6AB} <b>Disable Model</b>',
     '',
-    'Model yang di-disable tidak bisa dipakai lewat API dan disembunyikan dari daftar model user.',
+    'Model yang di-disable tidak bisa dipakai lewat API dan disembunyikan dari daftar model user, kecuali oleh user yang punya <b>Kode Akses Model</b> aktif untuk model itu.',
     '\u{1F7E2} semua aktif • \u{1F7E1} sebagian disabled • \u{1F534} family disabled',
     '',
     ...lines,
@@ -1623,10 +1624,12 @@ async function handleBansosTimeInput(chatId, userId, text) {
 // ---------- Model access codes ----------
 // Admin Panel -> Kode Akses Model. The admin picks one or more models and a period; the API server
 // stores a unique, single-use code (MDL-XXXXXX-XXXXXX). The user who redeems it (Redeem Code or
-// /redeem) may use ONLY those models while the period runs: server.js checks every request and
-// lifts the limit by itself once the period is over. Prices, balance, BANSOS, disabled models and
-// rate limits work as before. The API server checks the admin id again when a code is created or
-// disabled, so these buttons are not the only gate. Model names, codes and user names always go
+// /redeem) gets extra access while the period runs: those models stay usable for them even when
+// the admin has disabled them for everyone else (Disable Model), which makes them exclusive to
+// code holders. Every other model keeps working as usual: a code never blocks anything. server.js
+// checks every request and the extra access ends by itself once the period is over. Prices,
+// balance, BANSOS and rate limits work as before. The API server checks the admin id again when
+// a code is created or disabled, so these buttons are not the only gate. Model names, codes and user names always go
 // through escapeHtml before they are put into an HTML message.
 
 // [button label, minutes]
@@ -1682,18 +1685,18 @@ const ACCESS_USER_TEXT = {
     code: 'Kode',
     models: 'Model',
     period: 'Berlaku',
-    scheduled: (start) => `\u{23F3} Akses dimulai <b>${start}</b>. Sampai saat itu akses model kamu masih normal.`,
-    combined: 'Bersama kode akses lain yang masih aktif, model yang bisa kamu pakai sekarang',
-    rule: '\u{26A0}\u{FE0F} Selama periode ini API key kamu <b>hanya bisa memakai model di atas</b>; model lain akan ditolak. Setelah periode berakhir, akses model kembali normal otomatis.',
+    scheduled: (start) => `\u{23F3} Akses khusus dimulai <b>${start}</b>. Sampai saat itu akses model kamu masih seperti biasa.`,
+    combined: 'Bersama kode akses lain yang masih aktif, model akses khusus kamu sekarang',
+    rule: '\u{2705} Selama periode ini kamu <b>bisa memakai model di atas</b>, termasuk saat model itu sedang ditutup untuk user lain. Model lain tetap bisa dipakai seperti biasa. Setelah periode berakhir, akses khusus ini selesai otomatis.',
     billing: '\u{1F4B3} Pemakaian tetap memotong saldo / bonus token sesuai harga model.',
     tryAnother: '\u{1F501} Coba kode lain',
     back: '\u{1F519} Kembali ke menu',
     cardTitle: '\u{1F510} <b>Kode Akses Model</b>',
-    cardOnly: 'Hanya model ini yang bisa dipakai',
+    cardOnly: 'Akses khusus ke',
     cardUntil: 'sampai',
     cardStarts: 'mulai',
-    notice: (models, until) => `\u{1F510} <b>Kode akses model aktif</b> sampai ${until}: API key kamu hanya bisa memakai ${models}.`,
-    stopped: (code) => `\u{1F6D1} Akses dari kode <code>${code}</code> dihentikan oleh admin. Akses model kamu kembali normal.`,
+    notice: (models, until) => `\u{1F510} <b>Kode akses model aktif</b> sampai ${until}: kamu punya akses khusus ke ${models}. Model lain tetap bisa dipakai seperti biasa.`,
+    stopped: (code) => `\u{1F6D1} Akses khusus dari kode <code>${code}</code> dihentikan oleh admin. Akses model kamu kembali seperti biasa.`,
     more: 'lainnya',
     length: durationText,
     left: (ms) => `sisa ${durationText(ms)}`,
@@ -1711,18 +1714,18 @@ const ACCESS_USER_TEXT = {
     code: 'Code',
     models: 'Models',
     period: 'Valid',
-    scheduled: (start) => `\u{23F3} Access starts <b>${start}</b>. Until then your model access stays as usual.`,
-    combined: 'Together with your other active access codes, the models you can use now',
-    rule: '\u{26A0}\u{FE0F} During this period your API keys can <b>only use the models above</b>; other models are rejected. When the period ends, your model access goes back to normal automatically.',
+    scheduled: (start) => `\u{23F3} Your extra access starts <b>${start}</b>. Until then your model access stays as usual.`,
+    combined: 'Together with your other active access codes, your extra models now',
+    rule: '\u{2705} During this period you <b>can use the models above</b>, even while they are closed for other users. All other models keep working as usual. When the period ends, this extra access ends automatically.',
     billing: '\u{1F4B3} Usage is still charged to your balance / bonus tokens at the model price.',
     tryAnother: '\u{1F501} Try another code',
     back: '\u{1F519} Back to menu',
     cardTitle: '\u{1F510} <b>Model Access Code</b>',
-    cardOnly: 'Only these models can be used',
+    cardOnly: 'Extra access to',
     cardUntil: 'until',
     cardStarts: 'starts',
-    notice: (models, until) => `\u{1F510} <b>Model access code active</b> until ${until}: your API keys can only use ${models}.`,
-    stopped: (code) => `\u{1F6D1} The access from code <code>${code}</code> was stopped by the admin. Your model access is back to normal.`,
+    notice: (models, until) => `\u{1F510} <b>Model access code active</b> until ${until}: you have extra access to ${models}. All other models work as usual.`,
+    stopped: (code) => `\u{1F6D1} The extra access from code <code>${code}</code> was stopped by the admin. Your model access is back to usual.`,
     more: 'more',
     length: durationTextEn,
     left: (ms) => `${durationTextEn(ms)} left`,
@@ -1781,12 +1784,12 @@ function accessDraftComplete(draft) {
 
 // API Dashboard card for a user's active / upcoming access codes; '' when there are none.
 function modelAccessCard(access, lang = DEFAULT_LANGUAGE) {
-  if (!access || (!access.restricted && !(access.scheduled || []).length)) return '';
+  if (!access || (!access.granted && !(access.scheduled || []).length)) return '';
   const t = accessUserText(lang);
   const now = Date.now();
   const lines = [];
-  if (access.restricted) {
-    lines.push(`\u{2705} ${t.cardOnly}: ${accessModelsText(access.allowedModels, 12, t.more)}`);
+  if (access.granted) {
+    lines.push(`\u{2705} ${t.cardOnly}: ${accessModelsText(access.models, 12, t.more)}`);
     for (const grant of access.active.slice(0, 5)) {
       lines.push(`<code>${escapeHtml(grant.code)}</code> ${t.cardUntil} ${escapeHtml(wibTime(grant.endsAt))} (${t.left(Date.parse(grant.endsAt) - now)})`);
     }
@@ -1797,10 +1800,10 @@ function modelAccessCard(access, lang = DEFAULT_LANGUAGE) {
   return card(t.cardTitle, lines);
 }
 
-// One line for screens that list models (Model Price) while a code restricts the user.
+// One line for screens that list models (Model Price) while a code gives the user extra access.
 function modelAccessNotice(access, lang = DEFAULT_LANGUAGE) {
   const t = accessUserText(lang);
-  return t.notice(accessModelsText(access.allowedModels, 12, t.more), escapeHtml(wibTime(access.restrictedUntil)));
+  return t.notice(accessModelsText(access.models, 12, t.more), escapeHtml(wibTime(access.grantedUntil)));
 }
 
 // A user sent an MDL-... code (Redeem Code button, /redeem <code>, or just the code).
@@ -1824,7 +1827,7 @@ async function performAccessRedeem(chatId, from, rawCode) {
     });
   }
   const length = Date.parse(result.endsAt) - Date.parse(result.startsAt);
-  const allowed = result.access?.allowedModels || [];
+  const allowed = result.access?.models || [];
   const lines = [
     t.title,
     '',
@@ -1860,7 +1863,9 @@ async function adminAccessCodesView(notice = '') {
     ...(notice ? [notice, ''] : []),
     '\u{1F510} <b>Kode Akses Model</b>',
     '',
-    'Kode unik <b>sekali pakai</b> yang mengikat model pilihan dan periode. User yang menukarkannya <b>hanya bisa memakai model tersebut</b> selama periode berlaku; model lain ditolak. Setelah periode selesai, akses model user kembali normal otomatis. Harga &amp; saldo tetap seperti biasa.',
+    'Kode unik <b>sekali pakai</b> yang mengikat model pilihan dan periode. Selama periode berlaku, user yang menukarkannya <b>tetap bisa memakai model tersebut walaupun model itu di-disable</b> untuk user lain, jadi model itu eksklusif untuk pemegang kode. Model lain tetap bisa dipakai seperti biasa. Setelah periode selesai, akses khusus ini berakhir otomatis. Harga &amp; saldo tetap seperti biasa.',
+    '',
+    '<i>Cara pakai: disable model di menu Disable Model, lalu bagikan kode akses untuk model itu.</i>',
     '',
     codes.length ? `\u{1F4CB} <b>Kode terbaru</b> (${codes.length})` : '\u{1F4CB} Belum ada kode.',
     ...codes.map((entry) => [
@@ -1930,7 +1935,7 @@ async function adminAccessTargetsView(userId, notice = '') {
     ...(notice ? [notice, ''] : []),
     '\u{1F510} <b>Buat Kode Akses</b> \u{2014} 1/3 Pilih model',
     '',
-    `Tap family untuk memilih modelnya (satu atau lebih, maks. ${ACCESS_MAX_MODELS}). User yang menukarkan kode hanya bisa memakai model yang dipilih di sini.`,
+    `Tap family untuk memilih modelnya (satu atau lebih, maks. ${ACCESS_MAX_MODELS}). User yang menukarkan kode bisa memakai model yang dipilih di sini walaupun model itu di-disable untuk user lain.`,
     '\u{2705} semua model family \u{2022} \u{2611}\u{FE0F} sebagian \u{2022} \u{26AA} belum dipilih',
     '',
     `Dipilih (${draft.models.length}): ${accessModelsText(draft.models, 12)}`,
@@ -2011,9 +2016,13 @@ function adminAccessPeriodView(draft, notice = '') {
 
 // Step 3.
 async function adminAccessConfirmView(draft, notice = '') {
-  // A picked model that is disabled right now stays unusable; say so before the code goes out.
+  // Exclusive = disabled for everyone else right now; the others are open to all users anyway.
   const disabled = await getDisabledModels().catch(() => null);
   const off = disabled ? draft.models.filter((model) => isDisabledIn(disabled, model)) : [];
+  const open = draft.models.filter((model) => !off.includes(model));
+  const status = [];
+  if (off.length) status.push(`\u{1F512} Eksklusif (sedang di-disable untuk user lain, pemegang kode tetap bisa pakai): ${accessModelsText(off, 10)}`);
+  if (open.length) status.push(`\u{2139}\u{FE0F} Sedang terbuka untuk semua user: ${accessModelsText(open, 10)}. Kode baru terasa manfaatnya untuk model ini kalau model itu di-disable di menu <b>Disable Model</b>.`);
   const text = [
     ...(notice ? [notice, ''] : []),
     '\u{1F510} <b>Buat Kode Akses</b> \u{2014} 3/3 Konfirmasi',
@@ -2021,9 +2030,9 @@ async function adminAccessConfirmView(draft, notice = '') {
     `\u{1F916} Model (${draft.models.length}): ${accessModelsText(draft.models, ACCESS_MAX_MODELS)}`,
     `\u{1F552} Periode: <b>${accessPeriodText(draft)}</b>`,
     `\u{23F3} Batas redeem: <b>${accessDeadlineText(draft)}</b>`,
-    ...(off.length ? ['', `\u{26A0}\u{FE0F} Sedang di-disable (tetap tidak bisa dipakai sampai di-enable lagi): ${accessModelsText(off, 10)}`] : []),
+    ...(status.length ? ['', ...status] : []),
     '',
-    'Kode ini <b>sekali pakai</b> (1 user). Selama periode akses, user itu <b>hanya bisa memakai model di atas</b> lewat API: model lain ditolak dan tidak tampil di <code>/v1/models</code>. Setelah periode berakhir, akses model kembali normal otomatis.',
+    'Kode ini <b>sekali pakai</b> (1 user). Selama periode akses, user itu <b>bisa memakai model di atas</b> lewat API walaupun model itu di-disable untuk user lain. Model lain tetap bisa dipakai seperti biasa (tidak dibatasi). Setelah periode berakhir, akses khusus ini selesai otomatis.',
     '<i>Harga, saldo, bonus token, BANSOS dan rate limit tetap berlaku seperti biasa.</i>',
   ].join('\n');
   return { text, reply_markup: { inline_keyboard: [
@@ -2157,7 +2166,7 @@ async function handleAccessCodeAction(query, action) {
     if (result.changed && result.previousStatus === 'available') {
       notice = '\u{1F6AB} Kode dinonaktifkan dan tidak bisa ditukar lagi.';
     } else if (result.changed) {
-      notice = '\u{1F6D1} Akses dihentikan. Akses model user kembali normal.';
+      notice = '\u{1F6D1} Akses khusus dihentikan. Akses model user kembali seperti biasa.';
       const target = result.code.redemption?.telegramId;
       if (target) {
         const account = await getUser(target).catch(() => null);
@@ -2179,7 +2188,7 @@ async function handleAccessCodeAction(query, action) {
     if (!running && entry.status !== 'available') return showAdminView(query, await adminAccessCodeView(entry.code, 'Kode ini sudah tidak aktif.'));
     const code = escapeHtml(entry.code);
     const text = running
-      ? `\u{1F6D1} Hentikan akses dari kode <code>${code}</code> sekarang?\n\n${accessUserLabel(entry.redemption)} tidak lagi dibatasi oleh kode ini; akses modelnya kembali normal (kecuali masih punya kode akses lain yang aktif). Tidak bisa dibatalkan.`
+      ? `\u{1F6D1} Hentikan akses dari kode <code>${code}</code> sekarang?\n\n${accessUserLabel(entry.redemption)} kehilangan akses khusus dari kode ini: model yang di-disable tidak bisa dipakainya lagi (kecuali masih ada di kode akses lain yang aktif). Model lain tidak terpengaruh. Tidak bisa dibatalkan.`
       : `\u{1F6AB} Nonaktifkan kode <code>${code}</code>?\n\nKode tidak bisa ditukar lagi. Tidak bisa dibatalkan.`;
     return showAdminView(query, { text, reply_markup: { inline_keyboard: [[
       { text: running ? '\u{2705} Ya, hentikan' : '\u{2705} Ya, nonaktifkan', callback_data: `admin_mac_offok_${entry.code}` },
