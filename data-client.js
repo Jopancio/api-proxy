@@ -4,9 +4,9 @@
 // data/ files directly, exactly like before.
 //
 // Different hosts (DATA_API_URL set): every call goes to server.js's
-// /internal/rpc endpoint, so API keys, balances, redeem codes, tickets and
-// settings live in ONE database on the API server. That is what makes an API
-// key created in the bot valid in the API.
+// /internal/rpc endpoint, so API keys, balances, redeem codes, model access
+// codes, tickets and settings live in ONE database on the API server. That is
+// what makes an API key created in the bot valid in the API.
 //
 // Every function here is async in both modes.
 const crypto = require('crypto');
@@ -18,6 +18,7 @@ const REQUEST_TIMEOUT_MS = 15_000;
 const FUNCTION_NAMES = [
   'ensureUser', 'setUserLanguage', 'createApiKey', 'getUser', 'getAllUsers', 'getAdminLogs', 'adjustBalance', 'getOrder', 'revokeApiKey',
   'createOrder', 'settleOrder', 'createRedeemCode', 'redeemCode', 'listRedeemCodes', 'disableRedeemCode', 'getAdminStats', 'resetStats',
+  'createAccessCode', 'redeemAccessCode', 'listAccessCodes', 'getAccessCode', 'disableAccessCode', 'getModelAccess',
   'getReferralInfo', 'startWithReferral', 'getReferralSettings', 'setReferralSettings',
   'createTicket', 'addTicketMessage', 'linkAdminMessage', 'findTicketByAdminMessage', 'getTicket', 'getOpenTicketForUser',
   'listTickets', 'countOpenTickets', 'closeTicket',

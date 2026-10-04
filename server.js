@@ -77,6 +77,13 @@ const INTERNAL_FUNCTIONS = {
   redeemCode: usageDb.redeemCode,
   listRedeemCodes: usageDb.listRedeemCodes,
   disableRedeemCode: usageDb.disableRedeemCode,
+  // Model access codes. createAccessCode / disableAccessCode refuse anyone but ADMIN_TELEGRAM_ID.
+  createAccessCode: usageDb.createAccessCode,
+  redeemAccessCode: usageDb.redeemAccessCode,
+  listAccessCodes: usageDb.listAccessCodes,
+  getAccessCode: usageDb.getAccessCode,
+  disableAccessCode: usageDb.disableAccessCode,
+  getModelAccess: usageDb.getModelAccess,
   getAdminStats: usageDb.getAdminStats,
   resetStats: usageDb.resetStats,
   getReferralInfo: usageDb.getReferralInfo,
@@ -457,6 +464,44 @@ function bansosFor(model) {
   return adminSettings.getBansosFor(displayName, getModelFamily(displayName));
 }
 
+// Model access codes (bot: Redeem Code with an MDL-... code). While a redeemed code is active,
+// the user's keys may ONLY use that code's models. Worked out from the clock on every request, so
+// the user's normal model access comes back by itself when the period ends. Null = no limit now.
+// Tolerates a usage-db.js uploaded before access codes existed: nobody is restricted then.
+function activeModelAccess(user) {
+  if (typeof usageDb.modelAccessFor !== 'function') return null;
+  const access = usageDb.modelAccessFor(user);
+  return access && access.restricted && Array.isArray(access.allowedModels) ? access : null;
+}
+
+// The error body for a request the active access code does not allow, or null when it is allowed.
+function modelAccessViolation(req, access) {
+  const model = req.body && req.body.model;
+  const allowed = access.allowedModels.join(', ');
+  const until = access.restrictedUntil;
+  if (typeof model === 'string' && model.trim()) {
+    const displayName = stripModelPrefix(model).trim();
+    if (access.allowedModels.includes(displayName.toLowerCase())) return null;
+    return {
+      error: {
+        message: `Model '${displayName}' is not included in your model access code. Until ${until} this API key can only use: ${allowed}.`,
+        type: 'model_not_allowed',
+        code: 'model_access_restricted',
+      },
+    };
+  }
+  // Reading (e.g. GET /v1/models) is fine. A write without a JSON "model" cannot be checked, so
+  // it would let the upstream pick a model: refuse it while the restriction is on.
+  if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return null;
+  return {
+    error: {
+      message: `Your model access code is active until ${until}: set "model" to one of: ${allowed}.`,
+      type: 'model_required',
+      code: 'model_access_restricted',
+    },
+  };
+}
+
 // Every API request must use an active generated user key.
 app.use('/v1', (req, res, next) => {
   const clientApiKey = getClientApiKey(req);
@@ -466,6 +511,13 @@ app.use('/v1', (req, res, next) => {
   if (!user) return res.status(401).json({ error: { message: 'Invalid or revoked API key', type: 'invalid_api_key' } });
   req.userApiKey = clientApiKey;
   req.userRecord = user;
+  // Checked before the balance, so a restricted user is told which models they may use.
+  const access = activeModelAccess(user);
+  if (access) {
+    req.modelAccess = access;
+    const violation = modelAccessViolation(req, access);
+    if (violation) return res.status(403).json(violation);
+  }
   const balance = Number(user.balance || 0);
   // Referral bonus tokens also let a user call the API with a zero Rp balance.
   const bonusTokens = Number(user.bonusTokens || 0);
@@ -663,7 +715,8 @@ function resolveUpstreamModel(model) {
 }
 
 // Return a normalized model list so clients see `gpt-6-astra`, not `1/gpt-6-astra`.
-app.get('/v1/models', async (_req, res) => {
+// While the caller's model access code is active, only that code's models are listed.
+app.get('/v1/models', async (req, res) => {
   try {
     const upstream = await fetch(`${UPSTREAM_BASE_URL}/models`, {
       headers: API_KEY ? { Authorization: `Bearer ${API_KEY}` } : {},
@@ -685,7 +738,9 @@ app.get('/v1/models', async (_req, res) => {
       if (adminSettings.isModelDisabled(displayName, getModelFamily(displayName))) continue;
       byDisplayName.set(displayName, { id: displayName, object: 'model', owned_by: (getModelFamily(displayName) || 'deepseek').toLowerCase() });
     }
-    return res.json({ ...payload, data: [...byDisplayName.values()] });
+    const allowed = req.modelAccess?.allowedModels;
+    const data = [...byDisplayName.values()].filter((model) => !allowed || allowed.includes(String(model.id).toLowerCase()));
+    return res.json({ ...payload, data });
   } catch (error) {
     return res.status(502).json({ error: { message: 'Could not load upstream models', detail: error.message } });
   }

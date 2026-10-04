@@ -69,6 +69,35 @@ Admin Logs records the last 500 `/v1` requests, including method, path, status,
 duration, model, and user ID.
 Free mode still requires a valid user API key; it only skips balance deduction.
 
+### Model access codes
+
+Admin Panel -> **Kode Akses Model** creates unique, single-use codes
+(`MDL-XXXXXX-XXXXXX`) that bind one or more models and a period. The admin picks
+the models, then one of two period kinds:
+
+- **Duration since redemption** (e.g. 7 days): access starts when the user
+  redeems the code. The code can be redeemed until its redeem deadline
+  (default 30 days after it was created, adjustable).
+- **Fixed range** (start and end, WIB): access only runs inside that window,
+  whenever the code is redeemed. Once the end has passed the code is expired.
+  A code redeemed before the start waits for the start.
+
+Users redeem the code with the same **Redeem Code** button or `/redeem <code>`
+as balance codes. While the code is active, the user's API keys can only use the
+code's models: other models get HTTP `403` (`model_not_allowed`), write requests
+without a `model` get `403` (`model_required`), and `/v1/models` only lists the
+allowed models. Several active codes add up. When the period ends the user's
+normal model access comes back by itself (it is worked out from the clock on
+every request). Prices, balance, bonus tokens, BANSOS, disabled models and rate
+limits are unchanged.
+
+The admin list shows each code's status (unused, in use, waiting to start,
+finished, expired, disabled, stopped). The admin can disable an unused code, or
+stop a running one, which gives the user normal access again at once. Codes
+live in `data/users.json` (`accessCodes`, plus `modelAccess` on the user). The
+data layer refuses to create or disable codes for anyone other than
+`ADMIN_TELEGRAM_ID` (default `6957236291`, set it on both hosts when they are split).
+
 Top ups use Cashi.id. Set the Cashi API key and webhook secret, then configure
 your Cashi webhook URL as:
 
