@@ -19,6 +19,7 @@ const FUNCTION_NAMES = [
   'ensureUser', 'setUserLanguage', 'createApiKey', 'getUser', 'getAllUsers', 'getAdminLogs', 'adjustBalance', 'getOrder', 'revokeApiKey',
   'createOrder', 'settleOrder', 'createRedeemCode', 'redeemCode', 'listRedeemCodes', 'disableRedeemCode', 'getAdminStats', 'resetStats',
   'createAccessCode', 'redeemAccessCode', 'listAccessCodes', 'getAccessCode', 'disableAccessCode', 'getModelAccess',
+  'getUsageSummary', 'listUsersPage',
   'getReferralInfo', 'startWithReferral', 'getReferralSettings', 'setReferralSettings',
   'createTicket', 'addTicketMessage', 'linkAdminMessage', 'findTicketByAdminMessage', 'getTicket', 'getOpenTicketForUser',
   'listTickets', 'countOpenTickets', 'closeTicket',

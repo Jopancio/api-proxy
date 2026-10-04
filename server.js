@@ -3,6 +3,7 @@ require('dotenv').config();
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const zlib = require('zlib');
 const express = require('express');
 const morgan = require('morgan');
 const { createProxyMiddleware, fixRequestBody } = require('http-proxy-middleware');
@@ -84,6 +85,8 @@ const INTERNAL_FUNCTIONS = {
   getAccessCode: usageDb.getAccessCode,
   disableAccessCode: usageDb.disableAccessCode,
   getModelAccess: usageDb.getModelAccess,
+  getUsageSummary: usageDb.getUsageSummary,
+  listUsersPage: usageDb.listUsersPage,
   getAdminStats: usageDb.getAdminStats,
   resetStats: usageDb.resetStats,
   getReferralInfo: usageDb.getReferralInfo,
@@ -420,6 +423,7 @@ app.use('/v1', (req, res, next) => {
       pricePerMillion: usage.pricePerMillion || 0,
       cost: usage.cost || 0,
       balanceAfter: usage.balanceAfter,
+      ...(usage.estimated ? { estimated: true } : {}),
     });
   });
   next();
@@ -725,6 +729,184 @@ app.get('/v1/models', async (req, res) => {
   }
 });
 
+// ---------- Token usage for billing ----------
+// Billing uses the token counts the upstream reports. Three gaps are closed here:
+//  1. Streaming chat/completions only report usage when the request asks for it, so the proxy adds
+//     stream_options.include_usage. The client then also receives the standard final chunk with
+//     `"choices": []` and the usage. FORCE_STREAM_USAGE=false turns this off.
+//  2. A compressed upstream response (gzip / deflate / br) is decompressed for reading only; the
+//     client still receives the bytes unchanged.
+//  3. Usage is read from OpenAI chat/completions, Responses API (response.completed) and Anthropic
+//     messages (message_start + message_delta) streams. When a successful generation response still
+//     has no usage at all, the tokens are estimated from the text (about 4 characters per token,
+//     1 per CJK character) and the request is billed with `estimated: true` in the logs.
+const FORCE_STREAM_USAGE = String(process.env.FORCE_STREAM_USAGE ?? 'true').trim().toLowerCase() !== 'false';
+const STREAM_USAGE_PATH = /^\/v1\/(chat\/completions|completions)\/?$/;
+const GENERATION_PATH = /^\/v1\/(chat\/completions|completions|responses|messages)\/?$/;
+const WIDE_CHARACTERS = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff]/g;
+
+function requestPath(req) {
+  return String(req.originalUrl || req.url || '').split('?')[0];
+}
+
+// Asks the upstream for usage on a streaming chat/completions request. True when it was added.
+function requestStreamUsage(req) {
+  if (!FORCE_STREAM_USAGE || req.method !== 'POST' || !req.body || req.body.stream !== true) return false;
+  if (!STREAM_USAGE_PATH.test(requestPath(req))) return false;
+  const current = req.body.stream_options;
+  const options = current && typeof current === 'object' && !Array.isArray(current) ? current : {};
+  if (options.include_usage === true) return false;
+  req.body.stream_options = { ...options, include_usage: true };
+  return true;
+}
+
+// The response body as text, decompressed when the upstream compressed it. A body cut off midway
+// (client hung up) is decoded as far as it goes.
+function responseText(buffer, contentEncoding) {
+  let data = buffer;
+  const encodings = String(contentEncoding || '').toLowerCase().split(',').map((value) => value.trim()).filter(Boolean).reverse();
+  for (const encoding of encodings) {
+    if (encoding === 'identity') continue;
+    if (encoding === 'gzip' || encoding === 'x-gzip') {
+      data = zlib.gunzipSync(data, { finishFlush: zlib.constants.Z_SYNC_FLUSH });
+    } else if (encoding === 'deflate') {
+      try {
+        data = zlib.inflateSync(data, { finishFlush: zlib.constants.Z_SYNC_FLUSH });
+      } catch (_) {
+        data = zlib.inflateRawSync(data, { finishFlush: zlib.constants.Z_SYNC_FLUSH });
+      }
+    } else if (encoding === 'br') {
+      data = zlib.brotliDecompressSync(data, { finishFlush: zlib.constants.BROTLI_OPERATION_FLUSH });
+    } else {
+      throw new Error(`unsupported content-encoding "${encoding}"`);
+    }
+  }
+  return data.toString('utf8');
+}
+
+// Text of a message content: a string, or OpenAI / Anthropic content parts (tool results nested).
+function partsText(value, depth = 0) {
+  if (typeof value === 'string') return value;
+  if (!Array.isArray(value) || depth > 4) return '';
+  return value.map((part) => {
+    if (typeof part === 'string') return part;
+    if (!part || typeof part !== 'object') return '';
+    if (typeof part.text === 'string') return part.text;
+    if (part.content !== undefined) return partsText(part.content, depth + 1);
+    if (part.type === 'tool_use' && part.input) return JSON.stringify(part.input);
+    return '';
+  }).filter(Boolean).join('\n');
+}
+
+// Everything in the request that the model reads as text (images are not counted).
+function requestTextForEstimate(body) {
+  if (!body || typeof body !== 'object') return '';
+  const parts = [partsText(body.system)];
+  if (typeof body.instructions === 'string') parts.push(body.instructions);
+  const items = [...(Array.isArray(body.messages) ? body.messages : []), ...(Array.isArray(body.input) ? body.input : [])];
+  for (const item of items) {
+    if (typeof item === 'string') {
+      parts.push(item);
+      continue;
+    }
+    if (!item || typeof item !== 'object') continue;
+    parts.push(partsText(item.content));
+    for (const call of Array.isArray(item.tool_calls) ? item.tool_calls : []) parts.push(String(call?.function?.arguments || ''));
+    if (typeof item.output === 'string') parts.push(item.output);
+    if (typeof item.arguments === 'string') parts.push(item.arguments);
+  }
+  if (typeof body.input === 'string') parts.push(body.input);
+  if (typeof body.prompt === 'string') parts.push(body.prompt);
+  if (Array.isArray(body.prompt)) parts.push(body.prompt.filter((value) => typeof value === 'string').join('\n'));
+  if (Array.isArray(body.tools) && body.tools.length) parts.push(JSON.stringify(body.tools));
+  return parts.filter(Boolean).join('\n');
+}
+
+// Generated text in one response object or stream event (deltas only, so nothing is counted twice).
+function generatedText(event) {
+  if (!event || typeof event !== 'object') return '';
+  const parts = [];
+  for (const choice of Array.isArray(event.choices) ? event.choices : []) {
+    const message = choice?.delta || choice?.message || {};
+    parts.push(partsText(message.content));
+    if (typeof message.reasoning_content === 'string') parts.push(message.reasoning_content);
+    if (typeof message.reasoning === 'string') parts.push(message.reasoning);
+    for (const call of Array.isArray(message.tool_calls) ? message.tool_calls : []) parts.push(String(call?.function?.arguments || ''));
+    if (typeof choice?.text === 'string') parts.push(choice.text);
+  }
+  // Responses API stream: response.output_text.delta, response.function_call_arguments.delta, ...
+  if (typeof event.type === 'string' && event.type.endsWith('.delta') && typeof event.delta === 'string') parts.push(event.delta);
+  // Anthropic stream.
+  if (event.type === 'content_block_delta' && event.delta) {
+    parts.push(String(event.delta.text || event.delta.partial_json || event.delta.thinking || ''));
+  }
+  // Non-streaming Responses API and Anthropic messages.
+  for (const item of Array.isArray(event.output) ? event.output : []) {
+    parts.push(partsText(item?.content));
+    if (typeof item?.arguments === 'string') parts.push(item.arguments);
+  }
+  if (event.type === 'message' && Array.isArray(event.content)) parts.push(partsText(event.content));
+  return parts.filter(Boolean).join('');
+}
+
+function estimateTokens(text) {
+  const value = String(text || '');
+  if (!value) return 0;
+  const wide = (value.match(WIDE_CHARACTERS) || []).length;
+  return Math.ceil((value.length - wide) / 4) + wide;
+}
+
+// { input, output } from one usage object (OpenAI or Anthropic field names), or null.
+function usageCounts(usage) {
+  if (!usage || typeof usage !== 'object') return null;
+  const input = Number(usage.prompt_tokens ?? usage.input_tokens);
+  const output = Number(usage.completion_tokens ?? usage.output_tokens);
+  if (!Number.isFinite(input) && !Number.isFinite(output)) return null;
+  return { input: Number.isFinite(input) ? input : 0, output: Number.isFinite(output) ? output : 0 };
+}
+
+// Reads a whole response (JSON or SSE). Counts are cumulative in every format we know, so the
+// highest value of each field wins: that also joins Anthropic's input (message_start) and output
+// (message_delta) counts. { found, inputTokens, outputTokens, model, outputText }.
+function readUsage(text) {
+  const result = { found: false, inputTokens: 0, outputTokens: 0, model: '', outputText: '' };
+  const pieces = [];
+  const take = (event) => {
+    if (!event || typeof event !== 'object') return;
+    for (const usage of [event.usage, event.response?.usage, event.message?.usage]) {
+      const counts = usageCounts(usage);
+      if (!counts) continue;
+      result.found = true;
+      result.inputTokens = Math.max(result.inputTokens, counts.input);
+      result.outputTokens = Math.max(result.outputTokens, counts.output);
+    }
+    const model = event.model || event.response?.model || event.message?.model;
+    if (typeof model === 'string' && model) result.model = model;
+    pieces.push(generatedText(event));
+  };
+  let whole;
+  try {
+    whole = JSON.parse(text);
+  } catch (_) {
+    whole = undefined;
+  }
+  if (whole !== undefined) {
+    take(whole);
+  } else {
+    // Streaming responses contain one JSON object per SSE data line.
+    for (const line of text.split(/\r?\n/)) {
+      if (!line.startsWith('data:')) continue;
+      const data = line.slice(5).trim();
+      if (!data || data === '[DONE]') continue;
+      try {
+        take(JSON.parse(data));
+      } catch (_) { /* Ignore non-JSON keep-alive chunks. */ }
+    }
+  }
+  result.outputText = pieces.join('');
+  return result;
+}
+
 // OpenAI-compatible endpoint:
 //   client baseURL: http://127.0.0.1:8080/v1
 //   request:        POST /v1/chat/completions
@@ -750,6 +932,8 @@ app.use(
           proxyReq.setHeader('Authorization', `Bearer ${API_KEY}`);
         }
         req.requestModel = stripModelPrefix(req.body?.model || '');
+        // Must happen before fixRequestBody, which writes req.body to the upstream.
+        req.streamUsageRequested = requestStreamUsage(req);
 
         if (req.body && ['POST', 'PUT', 'PATCH'].includes(req.method)) {
           fixRequestBody(proxyReq, req);
@@ -762,36 +946,31 @@ app.use(
         const chunks = [];
         proxyRes.on('data', (chunk) => chunks.push(chunk));
         proxyRes.on('end', () => {
-          let usage = {};
-          let model = '';
+          let parsed = { found: false, inputTokens: 0, outputTokens: 0, model: '', outputText: '' };
+          let readable = true;
           try {
-            const body = Buffer.concat(chunks).toString('utf8');
-            try {
-              const parsed = JSON.parse(body);
-              usage = parsed.usage || {};
-              model = parsed.model || '';
-            } catch (_) {
-              // Streaming responses contain one JSON object per SSE data line.
-              for (const line of body.split(/\r?\n/)) {
-                if (!line.startsWith('data:')) continue;
-                try {
-                  const parsed = JSON.parse(line.slice(5).trim());
-                  if (parsed.usage) usage = parsed.usage;
-                  if (parsed.model) model = parsed.model;
-                } catch (_) { /* Ignore non-JSON keep-alive chunks. */ }
-              }
-            }
-          } catch (_) {
-            // Streaming responses and non-JSON errors are still counted as requests.
+            parsed = readUsage(responseText(Buffer.concat(chunks), proxyRes.headers['content-encoding']));
+          } catch (error) {
+            // Undecodable bodies are still counted as requests (and estimated below when successful).
+            readable = false;
+            console.error(`[billing] could not read the response of ${req.originalUrl}: ${error.message}`);
           }
-          const inputTokens = usage.prompt_tokens ?? usage.input_tokens ?? 0;
-          const outputTokens = usage.completion_tokens ?? usage.output_tokens ?? 0;
-          const billingModel = model || req.requestModel;
+          let inputTokens = parsed.inputTokens;
+          let outputTokens = parsed.outputTokens;
+          const billingModel = parsed.model || req.requestModel;
+          // A successful generation without any reported tokens would otherwise be free.
+          const estimated = proxyRes.statusCode < 400 && req.method === 'POST' && GENERATION_PATH.test(requestPath(req))
+            && !(parsed.found && inputTokens + outputTokens > 0);
+          if (estimated) {
+            inputTokens = estimateTokens(requestTextForEstimate(req.body));
+            outputTokens = estimateTokens(parsed.outputText);
+            console.warn(`[billing] no usage from upstream for ${req.originalUrl} (${billingModel}, user ${req.userRecord?.telegramId || '-'}${readable ? '' : ', unreadable body'}): billed an estimate of ${inputTokens} + ${outputTokens} tokens`);
+          }
           // BANSOS requests cost Rp0, so neither the balance nor bonus tokens are used.
           const pricePerMillion = req.bansos ? 0 : require('./pricing').getBillingPrice(billingModel);
           const totalTokens = Number(inputTokens) + Number(outputTokens);
           const cost = pricePerMillion ? (totalTokens / 1_000_000) * pricePerMillion : 0;
-          req.usageDetails = { inputTokens, outputTokens, totalTokens, pricePerMillion, cost };
+          req.usageDetails = { inputTokens, outputTokens, totalTokens, pricePerMillion, cost, ...(estimated ? { estimated: true } : {}) };
           const recorded = recordUsage(req.userApiKey, {
             endpoint: req.originalUrl,
             statusCode: proxyRes.statusCode,
@@ -799,6 +978,7 @@ app.use(
             inputTokens,
             outputTokens,
             ...(req.bansos ? { pricePerMillion: 0 } : {}),
+            ...(estimated ? { estimated: true } : {}),
           });
           // Bonus tokens may have covered part of the bill: log what was really charged.
           if (recorded && typeof recorded === 'object') req.usageDetails.cost = recorded.cost;
