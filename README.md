@@ -53,7 +53,11 @@ existing keys and balances.
 
 The API Dashboard lists every active key and its usage totals. Users can create
 additional keys or revoke an existing key; revoked keys are rejected by the
-proxy immediately. Dashboard actions include Logs, Model Price, and Top Up Saldo.
+proxy immediately. Dashboard actions include Logs, Usage Summary, Model Price,
+and Top Up Saldo. **Usage Summary** (also `/usage`) shows requests, tokens and
+cost per model for today, the last 7 days (with a per-day breakdown) or the last
+30 days, in WIB. It is kept in `data/usage-daily.json` (last 31 days) and counts
+from the moment this feature was deployed.
 Use `/model` (or the Resync Models button) to fetch the latest model list from
 the upstream `/v1/models` endpoint and refresh `data/models.json`.
 Model IDs from Groq, Qwen, ChatGPT, Hy, DeepSeek, GLM, and Kimi are displayed
@@ -63,8 +67,16 @@ correct upstream model.
 
 The admin Telegram account is restricted to ID `6957236291`. It can open
 `/admin`, enable or disable global free-model mode, and broadcast announcements.
-The admin panel also supports fixed or custom balance adjustments: send `+50000`
-to add Rp50.000 or `-10000` to deduct Rp10.000 from a selected user.
+**Users & Top Up** lists users 10 per page (most recently active first) and
+searches by Telegram ID, `@username` or name. Each user has a page with balance,
+masked API keys, usage (total and last 7 days), active model access codes,
+referral, open ticket and the last requests, plus fixed or custom balance
+adjustments: send `+50000` to add Rp50.000 or `-10000` to deduct Rp10.000.
+Announcements and polls are sent in the background at most 20 messages per
+second (Telegram allows about 30), retrying when Telegram asks to slow down.
+The admin's status message shows progress and then how many were delivered,
+unreachable (blocked the bot / deleted account) or failed. A restart stops a
+running broadcast.
 Admin Logs records the last 500 `/v1` requests, including method, path, status,
 duration, model, and user ID.
 Free mode still requires a valid user API key; it only skips balance deduction.
@@ -108,6 +120,15 @@ https://your-domain.example/webhooks/cashi
 
 The webhook verifies `x-gateway-signature` with HMAC-SHA256 and credits a
 pending order only after Cashi sends `PAYMENT_SETTLED` with status `SETTLED`.
+
+Billing uses the token counts the upstream reports. For streaming
+`chat/completions` requests the proxy adds `stream_options.include_usage`, so
+the upstream sends a final usage chunk (clients also receive that standard
+chunk with `"choices": []`; set `FORCE_STREAM_USAGE=false` if the upstream
+rejects the field). Compressed responses are decompressed for reading, and
+usage is read from OpenAI, Responses API and Anthropic streams. When a
+successful generation still reports no tokens, they are estimated from the text
+(about 4 characters per token) and the log entry is marked as an estimate.
 
 Paid model prices include a default 25% markup, rounded to the nearest Rp50.
 Change `MODEL_PRICE_MARKUP` in `.env` to adjust the profit markup. Free models
