@@ -1,4 +1,5 @@
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { getBillingPrice, getModelFamily, PINNED_MODELS } = require('./pricing');
@@ -31,32 +32,178 @@ function writeDatabaseUnlocked(database) {
   fs.renameSync(temporaryPath, databasePath);
 }
 
-function waitBriefly() {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15);
+// ---------------------------------------------------------------------------
+// File locks (users.json.lock, prompts.json.lock, moderation.json.lock).
+//
+// A write holds its lock for milliseconds. Waiting for a lock uses exponential
+// backoff with jitter; when the wait budget runs out a DatabaseBusyError
+// (code EDB_BUSY) is thrown BEFORE anything was read or written, so the caller
+// can always retry it safely.
+//
+// The lock file records its owner (pid + host). A lock whose owner process is
+// gone, or that is older than LOCK_STALE_MS, was left behind by a process that
+// died mid-write (restart, kill, OOM) and is removed; before this, one such
+// file made every later write fail with "Database is busy" forever.
+// The two env variables only exist so tests can shorten the timings.
+// ---------------------------------------------------------------------------
+const LOCK_WAIT_MS = Number(process.env.USAGE_DB_LOCK_WAIT_MS) || 6_000; // was 400 x 15 ms
+const LOCK_STALE_MS = Number(process.env.USAGE_DB_LOCK_STALE_MS) || 30_000;
+const LOCK_BACKOFF_START_MS = 5;
+const LOCK_BACKOFF_MAX_MS = 250;
+// EPERM/EBUSY: on Windows a lock file that is being deleted cannot be re-created for a moment.
+const TRANSIENT_LOCK_ERRORS = new Set(['EEXIST', 'EPERM', 'EBUSY']);
+const HOSTNAME = os.hostname();
+const heldLocks = new Set(); // lock paths this process holds right now
+
+class DatabaseBusyError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'DatabaseBusyError';
+    this.code = 'EDB_BUSY';
+  }
+}
+
+function isDatabaseBusyError(error) {
+  return Boolean(error) && error.code === 'EDB_BUSY';
+}
+
+function sleepSync(ms) {
+  if (ms > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function processIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === 'EPERM'; // exists, but belongs to another user
+  }
+}
+
+// { raw, mtimeMs, owner } of the current lock file, null when it is gone,
+// undefined when it cannot be read right now.
+function readLockFile(lockFilePath) {
+  try {
+    const stat = fs.statSync(lockFilePath);
+    const raw = fs.readFileSync(lockFilePath, 'utf8');
+    let owner = {};
+    try {
+      owner = JSON.parse(raw) || {};
+    } catch (_) {
+      // Empty: created a moment ago and not written yet, or made by an older version of this file.
+    }
+    return { raw, mtimeMs: stat.mtimeMs, owner };
+  } catch (error) {
+    return error.code === 'ENOENT' ? null : undefined;
+  }
+}
+
+function lockIsStale(lockFilePath, lock) {
+  if (Date.now() - lock.mtimeMs > LOCK_STALE_MS) return true;
+  const { pid, host } = lock.owner;
+  // A pid is only meaningful on the host that wrote it.
+  if (host !== HOSTNAME || !Number.isInteger(pid)) return false;
+  // Our own pid on a lock we do not hold: left by an earlier process that had this pid.
+  if (pid === process.pid) return !heldLocks.has(lockFilePath);
+  return !processIsAlive(pid);
+}
+
+function breakStaleLock(lockFilePath, lock) {
+  // Move it aside first, then make sure what was moved is the lock judged stale:
+  // if another process replaced it in between, put that fresh lock back.
+  const asidePath = `${lockFilePath}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.stale`;
+  try {
+    fs.renameSync(lockFilePath, asidePath);
+  } catch (error) {
+    return; // already gone or not movable right now: the caller just retries
+  }
+  const moved = readLockFile(asidePath);
+  if (moved && (moved.raw !== lock.raw || moved.mtimeMs !== lock.mtimeMs)) {
+    try {
+      fs.linkSync(asidePath, lockFilePath);
+    } catch (_) { /* a newer lock exists already */ }
+  } else {
+    const ageSeconds = Math.round((Date.now() - lock.mtimeMs) / 1000);
+    console.warn(`[db] removed stale lock ${path.basename(lockFilePath)} (owner ${lock.raw || 'unknown'}, ${ageSeconds}s old)`);
+  }
+  fs.rmSync(asidePath, { force: true });
+}
+
+function acquireLock(lockFilePath, busyMessage) {
+  const token = JSON.stringify({ pid: process.pid, host: HOSTNAME, at: new Date().toISOString(), id: crypto.randomBytes(6).toString('hex') });
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  let backoff = LOCK_BACKOFF_START_MS;
+  let lastError;
+  for (;;) {
+    let retryNow = false;
+    try {
+      const handle = fs.openSync(lockFilePath, 'wx');
+      heldLocks.add(lockFilePath);
+      try {
+        fs.writeSync(handle, token);
+        return { handle, token };
+      } catch (_) {
+        return { handle, token: '' }; // the owner record only helps stale-lock detection
+      }
+    } catch (error) {
+      if (!TRANSIENT_LOCK_ERRORS.has(error.code)) throw error;
+      lastError = error;
+      if (error.code === 'EEXIST') {
+        const current = readLockFile(lockFilePath);
+        if (current === null) {
+          retryNow = true; // released in the meantime
+        } else if (current && lockIsStale(lockFilePath, current)) {
+          breakStaleLock(lockFilePath, current);
+          retryNow = true;
+        }
+      }
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      // EPERM/EBUSY that never cleared is a real file-system problem, not contention: report it as is.
+      if (lastError && lastError.code !== 'EEXIST') throw lastError;
+      throw new DatabaseBusyError(busyMessage);
+    }
+    if (!retryNow) {
+      sleepSync(Math.min(remaining, backoff + Math.floor(Math.random() * backoff)));
+      backoff = Math.min(backoff * 2, LOCK_BACKOFF_MAX_MS);
+    }
+  }
+}
+
+function releaseLock(lockFilePath, lock) {
+  heldLocks.delete(lockFilePath);
+  try {
+    fs.closeSync(lock.handle);
+  } catch (error) {
+    console.error(`[db] could not close ${path.basename(lockFilePath)}:`, error.message);
+  }
+  try {
+    // Only delete the lock while it is still ours. A failure here is logged, never thrown:
+    // it must not hide the write's result, and a leftover lock is recovered as stale.
+    if (fs.readFileSync(lockFilePath, 'utf8') === lock.token) fs.unlinkSync(lockFilePath);
+  } catch (error) {
+    if (error.code !== 'ENOENT') console.error(`[db] could not release ${path.basename(lockFilePath)}:`, error.message);
+  }
+}
+
+function withFileLock(lockFilePath, busyMessage, work) {
+  fs.mkdirSync(path.dirname(lockFilePath), { recursive: true });
+  const lock = acquireLock(lockFilePath, busyMessage);
+  try {
+    return work();
+  } finally {
+    releaseLock(lockFilePath, lock);
+  }
 }
 
 function mutateDatabase(mutator) {
-  fs.mkdirSync(path.dirname(databasePath), { recursive: true });
-  let lockHandle;
-  for (let attempt = 0; attempt < 400; attempt += 1) {
-    try {
-      lockHandle = fs.openSync(lockPath, 'wx');
-      break;
-    } catch (error) {
-      if (error.code !== 'EEXIST') throw error;
-      waitBriefly();
-    }
-  }
-  if (!lockHandle) throw new Error('Database is busy; try again');
-  try {
+  return withFileLock(lockPath, 'Database is busy; try again', () => {
     const database = readDatabase();
     const result = mutator(database);
     writeDatabaseUnlocked(database);
     return result;
-  } finally {
-    fs.closeSync(lockHandle);
-    fs.unlinkSync(lockPath);
-  }
+  });
 }
 
 function newUser(telegramId, profile = {}) {
@@ -1153,30 +1300,14 @@ function readPromptLog() {
 
 // Locked, atomic read-modify-write of a small JSON side file (prompts.json, moderation.json).
 function mutateLockedJson(filePath, read, mutator) {
-  const fileLockPath = `${filePath}.lock`;
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  let lockHandle;
-  for (let attempt = 0; attempt < 400; attempt += 1) {
-    try {
-      lockHandle = fs.openSync(fileLockPath, 'wx');
-      break;
-    } catch (error) {
-      if (error.code !== 'EEXIST') throw error;
-      waitBriefly();
-    }
-  }
-  if (!lockHandle) throw new Error(`${path.basename(filePath)} is busy; try again`);
-  try {
+  return withFileLock(`${filePath}.lock`, `${path.basename(filePath)} is busy; try again`, () => {
     const data = read();
     const result = mutator(data);
     const temporaryPath = `${filePath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
     fs.writeFileSync(temporaryPath, JSON.stringify(data), 'utf8');
     fs.renameSync(temporaryPath, filePath);
     return result;
-  } finally {
-    fs.closeSync(lockHandle);
-    fs.unlinkSync(fileLockPath);
-  }
+  });
 }
 
 function mutatePromptLog(mutator) {
@@ -1376,4 +1507,5 @@ module.exports = { ensureUser, setUserLanguage, SUPPORTED_LANGUAGES, createApiKe
   createTicket, addTicketMessage, linkAdminMessage, findTicketByAdminMessage, getTicket, getOpenTicketForUser, listTickets, countOpenTickets, closeTicket,
   createPoll, votePoll, getPoll, listPolls, closePoll, setPollSent,
   recordPrompt, listPromptUsers, getUserPrompts, clearPrompts, clearAllPrompts, promptLogPath,
-  recordModerationBlock, addModerationStats, listModerationBlocks, getModerationBlock, clearModerationBlocks, moderationLogPath };
+  recordModerationBlock, addModerationStats, listModerationBlocks, getModerationBlock, clearModerationBlocks, moderationLogPath,
+  DatabaseBusyError, isDatabaseBusyError };

@@ -26,6 +26,48 @@ if (!UPSTREAM_BASE_URL) {
   process.exit(1);
 }
 
+// Last line of defence: a busy database is temporary and is thrown before anything was
+// written, so it must never take the whole API down. Every other uncaught error keeps
+// Node's default outcome (log and exit with code 1, the supervisor restarts the service).
+// Also receives unhandled promise rejections (origin 'unhandledRejection').
+// The message test also recognises the error from an older usage-db.js upload.
+const isDbBusy = (error) => error?.code === 'EDB_BUSY' || /is busy; try again$/.test(String(error?.message || ''));
+process.on('uncaughtException', (error, origin) => {
+  if (isDbBusy(error)) {
+    console.error(`[db] uncaught busy error ignored (${origin}):`, error.stack || error.message);
+    return;
+  }
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+
+// Database writes that run after a response (usage billing, request log, prompt log) happen
+// in event listeners, outside Express's error handling: a throw there used to kill the
+// process. A busy database is retried later with exponential backoff (non-blocking);
+// other failures are logged.
+const DB_RETRY_DELAYS_MS = [500, 1_000, 2_000, 4_000, 8_000, 16_000];
+function runDbWrite(label, write, onDone, attempt = 0) {
+  let result;
+  try {
+    result = write();
+  } catch (error) {
+    if (isDbBusy(error) && attempt < DB_RETRY_DELAYS_MS.length) {
+      const delay = DB_RETRY_DELAYS_MS[attempt] + Math.floor(Math.random() * 250);
+      console.warn(`[db] ${label}: ${error.message} (retry ${attempt + 1}/${DB_RETRY_DELAYS_MS.length} in ${delay} ms)`);
+      setTimeout(() => runDbWrite(label, write, onDone, attempt + 1), delay);
+      return;
+    }
+    console.error(`[db] ${label} NOT saved${attempt ? ` after ${attempt + 1} attempts` : ''}:`, error.message);
+    return;
+  }
+  if (!onDone) return;
+  try {
+    onDone(result);
+  } catch (error) {
+    console.error(`[db] ${label}: follow-up failed:`, error.message);
+  }
+}
+
 const app = express();
 
 // Request logging: method, path, status, response time, response size.
@@ -169,6 +211,11 @@ app.post('/internal/rpc', express.raw({ type: '*/*', limit: '1mb' }), (req, res)
     return res.json({ ok: true, result: result === undefined ? null : result });
   } catch (error) {
     console.error(`[internal] ${call.fn} failed:`, error.message);
+    // Busy: nothing was written, the bot retries the call (data-client.js).
+    if (isDbBusy(error)) {
+      res.set('Retry-After', '1');
+      return res.status(503).json({ ok: false, error: error.message, code: 'EDB_BUSY' });
+    }
     return res.status(500).json({ ok: false, error: error.message });
   }
 });
@@ -407,7 +454,7 @@ app.use('/v1', (req, res, next) => {
   const startedAt = Date.now();
   res.on('finish', () => {
     const usage = req.usageDetails || {};
-    recordAdminRequest({
+    const entry = {
       method: req.method,
       path: req.originalUrl,
       status: res.statusCode,
@@ -420,7 +467,8 @@ app.use('/v1', (req, res, next) => {
       pricePerMillion: usage.pricePerMillion || 0,
       cost: usage.cost || 0,
       balanceAfter: usage.balanceAfter,
-    });
+    };
+    runDbWrite(`request log ${entry.method} ${entry.path}`, () => recordAdminRequest(entry));
   });
   next();
 });
@@ -628,11 +676,7 @@ app.use('/v1', (req, res, next) => {
       const model = stripModelPrefix(req.body.model || '');
       const endpoint = `${req.baseUrl}${req.path}`;
       res.once('close', () => {
-        try {
-          usageDb.recordPrompt(telegramId, { text, model, endpoint, status: res.statusCode });
-        } catch (error) {
-          console.error('[prompts] could not save:', error.message);
-        }
+        runDbWrite(`prompt log user ${telegramId}`, () => usageDb.recordPrompt(telegramId, { text, model, endpoint, status: res.statusCode }));
       });
     }
   } catch (error) {
@@ -813,18 +857,21 @@ app.use(
           const totalTokens = Number(inputTokens) + Number(outputTokens);
           const cost = pricePerMillion ? (totalTokens / 1_000_000) * pricePerMillion : 0;
           req.usageDetails = { inputTokens, outputTokens, totalTokens, pricePerMillion, cost };
-          const recorded = recordUsage(req.userApiKey, {
+          const usageRecord = {
             endpoint: req.originalUrl,
             statusCode: proxyRes.statusCode,
             model: billingModel,
             inputTokens,
             outputTokens,
             ...(req.bansos ? { pricePerMillion: 0 } : {}),
+          };
+          const label = `usage user ${req.userRecord?.telegramId || '?'} ${billingModel} ${inputTokens}+${outputTokens} tokens`;
+          runDbWrite(label, () => recordUsage(req.userApiKey, usageRecord), (recorded) => {
+            // Bonus tokens may have covered part of the bill: log what was really charged.
+            if (recorded && typeof recorded === 'object') req.usageDetails.cost = recorded.cost;
+            const updatedUser = require('./usage-db').findUserByApiKey(req.userApiKey);
+            req.usageDetails.balanceAfter = updatedUser?.balance;
           });
-          // Bonus tokens may have covered part of the bill: log what was really charged.
-          if (recorded && typeof recorded === 'object') req.usageDetails.cost = recorded.cost;
-          const updatedUser = require('./usage-db').findUserByApiKey(req.userApiKey);
-          req.usageDetails.balanceAfter = updatedUser?.balance;
         });
       },
       error: (err, req, res) => {
@@ -846,6 +893,15 @@ app.get('/healthz', (_req, res) => {
     upstream: UPSTREAM_BASE_URL,
     authentication: API_KEY ? 'configured' : 'caller-provided',
   });
+});
+
+// A busy database inside a route (e.g. the Cashi webhook): answer 503 + Retry-After so the
+// caller retries, instead of Express's default HTML 500. Other errors keep the default handler.
+app.use((error, req, res, next) => {
+  if (!isDbBusy(error) || res.headersSent) return next(error);
+  console.error(`[db] ${req.method} ${req.originalUrl}:`, error.message);
+  res.set('Retry-After', '1');
+  return res.status(503).json({ error: { message: error.message, type: 'database_busy' } });
 });
 
 app.listen(PORT, HOST, () => {

@@ -75,9 +75,26 @@ async function callRemote(fn, args) {
   if (!response.ok || !result.ok) {
     const hint = response.status === 401 ? ' — INTERNAL_API_SECRET differs between bot and server, or the clocks are more than 5 minutes apart'
       : response.status === 404 ? ' — set INTERNAL_API_SECRET on the API server' : '';
-    throw new Error(`Data API ${fn} failed: ${result.error || response.status}${hint}`);
+    const error = new Error(`Data API ${fn} failed: ${result.error || response.status}${hint}`);
+    if (result.code) error.code = result.code;
+    throw error;
   }
   return result.result;
+}
+
+// "Database is busy" (code EDB_BUSY) is thrown before anything was written, so the call is
+// retried a few times with exponential backoff instead of failing the user's action.
+const BUSY_RETRY_DELAYS_MS = [250, 500, 1_000];
+async function retryWhenBusy(call) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await call();
+    } catch (error) {
+      if (error?.code !== 'EDB_BUSY' || attempt >= BUSY_RETRY_DELAYS_MS.length) throw error;
+      const delay = BUSY_RETRY_DELAYS_MS[attempt] + Math.floor(Math.random() * 100);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
 }
 
 function buildLocal() {
@@ -95,11 +112,11 @@ function buildLocal() {
       return true;
     },
   };
-  return Object.fromEntries(FUNCTION_NAMES.map((name) => [name, async (...args) => local[name](...args)]));
+  return Object.fromEntries(FUNCTION_NAMES.map((name) => [name, (...args) => retryWhenBusy(async () => local[name](...args))]));
 }
 
 function buildRemote() {
-  return Object.fromEntries(FUNCTION_NAMES.map((name) => [name, (...args) => callRemote(name, args)]));
+  return Object.fromEntries(FUNCTION_NAMES.map((name) => [name, (...args) => retryWhenBusy(() => callRemote(name, args))]));
 }
 
 module.exports = { ...(remote ? buildRemote() : buildLocal()), dataMode: remote ? `remote (${DATA_API_URL})` : 'local files' };
