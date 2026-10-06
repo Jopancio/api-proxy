@@ -27,7 +27,7 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const UPSTREAM_BASE_URL = process.env.UPSTREAM_BASE_URL || 'https://sg1-9682fffda636.shinsengumi.my.id/v1';
 const UPSTREAM_API_KEY = process.env.UPSTREAM_API_KEY || process.env.OPENAI_API_KEY;
 // Endpoint shown to users: the public proxy, not the upstream behind it.
-const PUBLIC_BASE_URL = 'http://78.154.103.47:10913/v1';
+const PUBLIC_BASE_URL = 'http://103.247.8.69:3000/v1';
 const CASHI_API_KEY = process.env.CASHI_API_KEY;
 const CASHI_API_URL = 'https://cashi.id/api/create-order';
 const ADMIN_TELEGRAM_ID = String(process.env.ADMIN_TELEGRAM_ID || '6957236291').trim();
