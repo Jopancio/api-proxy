@@ -293,7 +293,7 @@ function findUserByApiKey(apiKey) {
 }
 
 function recordUsage(apiKey, usage = {}) {
-  return mutateDatabase((database) => {
+  const recorded = mutateDatabase((database) => {
     let owner;
     for (const user of Object.values(database.users)) {
       if (user.apiKeys.some((entry) => entry.key === apiKey && entry.active !== false)) {
@@ -333,10 +333,26 @@ function recordUsage(apiKey, usage = {}) {
     pricePerMillion,
     cost,
     bonusTokensUsed,
+    // The upstream sent no token counts, so server.js estimated them from the text.
+    ...(usage.estimated ? { estimated: true } : {}),
   });
   owner.logs = owner.logs.slice(-50);
-    return { cost, bonusTokensUsed, balance: owner.balance, bonusTokens: owner.bonusTokens };
+    return { telegramId: owner.telegramId, cost, bonusTokensUsed, balance: owner.balance, bonusTokens: owner.bonusTokens, inputTokens, outputTokens, statusCode };
   });
+  if (!recorded) return recorded;
+  // The per-day summary is a convenience view: a failure there never undoes or blocks billing.
+  try {
+    recordDailyUsage(recorded.telegramId, {
+      model: usage.model,
+      inputTokens: recorded.inputTokens,
+      outputTokens: recorded.outputTokens,
+      cost: recorded.cost,
+      error: recorded.statusCode >= 400,
+    });
+  } catch (error) {
+    console.error('[usage-daily] could not save:', error.message);
+  }
+  return { cost: recorded.cost, bonusTokensUsed: recorded.bonusTokensUsed, balance: recorded.balance, bonusTokens: recorded.bonusTokens };
 }
 
 function getUser(telegramId) {
@@ -479,10 +495,12 @@ function disableRedeemCode(rawCode) {
 // ---------------------------------------------------------------------------
 // Model access codes (bot: Admin Panel -> Kode Akses Model). The admin binds one or
 // more models and a period to a unique single-use code "MDL-XXXXXX-XXXXXX". The user
-// who redeems it gets a grant: while the grant is active their API keys may ONLY use
-// those models (server.js checks this on every /v1 request). Whether a grant is active
-// is worked out from the clock on every check, so once it ends the user's model access
-// is back to normal by itself; no timer is involved.
+// who redeems it gets a grant: while the grant is active their API keys may use those
+// models even when the admin has disabled them (model or whole family) for everyone
+// else, so a disabled model becomes exclusive to code holders. Every other model stays
+// available exactly as before: a code never blocks anything. server.js checks this on
+// every /v1 request. Whether a grant is active is worked out from the clock on every
+// check, so once it ends the user's model access is back to normal by itself; no timer.
 //
 // Period kinds:
 //   duration  access lasts `durationMs` from the moment of redemption; the code can be
@@ -494,7 +512,7 @@ function disableRedeemCode(rawCode) {
 //   startsAt, endsAt, expiresAt, active, createdAt, createdBy, disabledAt?, disabledBy?,
 //   redemption: null | { telegramId, at, startsAt, endsAt, revokedAt? } } }
 // user.modelAccess = [ { code, models, startsAt, endsAt, redeemedAt, revokedAt? } ]
-// Several active grants of one user add up: the user may use every model of all of them.
+// Several active grants of one user add up: the user gets every model of all of them.
 // Creating and disabling codes is refused here unless the caller is ADMIN_TELEGRAM_ID.
 // ---------------------------------------------------------------------------
 
@@ -583,7 +601,8 @@ function validGrants(user) {
 
 // What the user's redeemed access codes mean at `now`. Pure (no file access), so
 // server.js can run it on the user record it already has for every request.
-// `restricted` false = normal model access. While true, only `allowedModels` may be used.
+// `granted` false = no extra access. While true, `models` (on top of every normally available
+// model) may be used even when the admin has disabled them.
 function modelAccessFor(user, now = Date.now()) {
   const grants = validGrants(user).map((grant) => ({
     code: grant.code,
@@ -597,12 +616,11 @@ function modelAccessFor(user, now = Date.now()) {
     .sort((a, b) => Date.parse(a.endsAt) - Date.parse(b.endsAt));
   const scheduled = grants.filter((grant) => grant.status === 'scheduled')
     .sort((a, b) => Date.parse(a.startsAt) - Date.parse(b.startsAt));
-  const allowedModels = active.length ? [...new Set(active.flatMap((grant) => grant.models))].sort() : null;
   return {
-    restricted: active.length > 0,
-    allowedModels,
-    // The current restriction lasts at least until the last active grant ends.
-    restrictedUntil: active.length ? active[active.length - 1].endsAt : null,
+    granted: active.length > 0,
+    models: [...new Set(active.flatMap((grant) => grant.models))].sort(),
+    // Some extra access lasts at least until the last active grant ends.
+    grantedUntil: active.length ? active[active.length - 1].endsAt : null,
     active,
     scheduled,
   };
@@ -888,12 +906,12 @@ function startWithReferral(telegramId, profile = {}, rawCode = '') {
 }
 
 // Zeroes the usage statistics on the admin dashboard: every user's request /
-// token / error / spent counters, every user's request log, and the admin
-// request log (the "last 24h" numbers). Balances, API keys, orders, redeem
+// token / error / spent counters, every user's request log and daily usage
+// summary, and the admin request log (the "last 24h" numbers). Balances, API keys, orders, redeem
 // codes, tickets and settings are NOT touched. A full copy of the database is
 // written next to it first, so a reset can be undone by restoring that file.
 function resetStats(resetBy = '') {
-  return mutateDatabase((database) => {
+  const result = mutateDatabase((database) => {
     const at = new Date().toISOString();
     const backupPath = `${databasePath}.stats-reset-${at.replace(/[:.]/g, '-')}.bak`;
     fs.writeFileSync(backupPath, JSON.stringify(database, null, 2), 'utf8');
@@ -908,6 +926,18 @@ function resetStats(resetBy = '') {
     database.statsResetBy = String(resetBy);
     return { at, users, backup: path.basename(backupPath) };
   });
+  // The per-day usage summaries count the same requests, so they start over too (backup first).
+  try {
+    if (fs.existsSync(usageDailyPath)) {
+      fs.copyFileSync(usageDailyPath, `${usageDailyPath}.stats-reset-${result.at.replace(/[:.]/g, '-')}.bak`);
+      mutateLockedJson(usageDailyPath, readUsageDaily, (data) => {
+        data.users = {};
+      });
+    }
+  } catch (error) {
+    console.error('[usage-daily] could not reset:', error.message);
+  }
+  return result;
 }
 
 // Aggregated numbers for the admin dashboard. Lifetime totals come from the
@@ -1500,6 +1530,204 @@ function clearModerationBlocks() {
   });
 }
 
+// ---------- Daily usage per model (bot: API Dashboard -> Usage Summary, admin user page) ----------
+// recordUsage adds every request to the user's day (WIB) and model. Kept in its own compact file
+// next to the main database (like prompts.json), so it does not grow the database that is rewritten
+// and backed up on every request. Only the last USAGE_DAYS_KEPT days are kept.
+// file = { prunedOn: 'YYYY-MM-DD', users: { <telegramId>: { 'YYYY-MM-DD': {
+//          <model>: [requests, errors, inputTokens, outputTokens, cost] } } } }
+const usageDailyPath = path.join(path.dirname(databasePath), 'usage-daily.json');
+const USAGE_DAYS_KEPT = 31; // enough for a "last 30 days" view that includes today
+const USAGE_DAY_MS = 24 * 60 * 60 * 1000;
+const USAGE_WIB_OFFSET_MS = 7 * 60 * 60 * 1000; // Asia/Jakarta has no daylight saving time
+const USAGE_MODEL_NAME = /^[a-z0-9][a-z0-9._:+-]{0,99}$/;
+const USAGE_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+// "YYYY-MM-DD" of `time` in WIB.
+function usageDayKey(time) {
+  return new Date(time + USAGE_WIB_OFFSET_MS).toISOString().slice(0, 10);
+}
+
+// Display name, lowercase; anything that does not look like a model name is counted as "other".
+function usageModelKey(model) {
+  const key = String(model || '').trim().replace(/^.*\//, '').toLowerCase();
+  if (!key) return 'unknown';
+  return USAGE_MODEL_NAME.test(key) ? key : 'other';
+}
+
+function readUsageDaily() {
+  try {
+    const data = JSON.parse(fs.readFileSync(usageDailyPath, 'utf8'));
+    if (data && isPlainObject(data.users)) return data;
+  } catch (error) {
+    // A damaged file only holds summaries: start over instead of blocking billing.
+    if (error.code !== 'ENOENT') console.error('[usage-daily] unreadable usage-daily.json, starting a new one:', error.message);
+  }
+  return { prunedOn: '', users: {} };
+}
+
+function pruneUsageDays(days, oldest) {
+  for (const date of Object.keys(days)) {
+    if (!USAGE_DATE.test(date) || date < oldest) delete days[date];
+  }
+}
+
+// Adds one request to the user's day. `entry` = { model, inputTokens, outputTokens, cost, error }.
+function recordDailyUsage(telegramId, entry = {}, now = Date.now()) {
+  const id = String(telegramId ?? '').trim();
+  if (!/^\d{1,20}$/.test(id)) return null;
+  const day = usageDayKey(now);
+  const oldest = usageDayKey(now - (USAGE_DAYS_KEPT - 1) * USAGE_DAY_MS);
+  const model = usageModelKey(entry.model);
+  return mutateLockedJson(usageDailyPath, readUsageDaily, (data) => {
+    const days = isPlainObject(data.users[id]) ? data.users[id] : {};
+    const models = isPlainObject(days[day]) ? days[day] : {};
+    const counts = Array.isArray(models[model]) ? models[model].map((value) => Number(value) || 0) : [0, 0, 0, 0, 0];
+    counts[0] += 1;
+    counts[1] += entry.error ? 1 : 0;
+    counts[2] += Math.max(0, Number(entry.inputTokens) || 0);
+    counts[3] += Math.max(0, Number(entry.outputTokens) || 0);
+    // Rp, kept to 6 decimals so the file does not fill up with float noise.
+    counts[4] = Math.round((counts[4] + Math.max(0, Number(entry.cost) || 0)) * 1e6) / 1e6;
+    models[model] = counts.slice(0, 5);
+    days[day] = models;
+    pruneUsageDays(days, oldest);
+    data.users[id] = days;
+    // Once a day, also drop the old days of users who have not made a request since.
+    if (data.prunedOn !== day) {
+      for (const [userId, userDays] of Object.entries(data.users)) {
+        if (!isPlainObject(userDays)) {
+          delete data.users[userId];
+          continue;
+        }
+        pruneUsageDays(userDays, oldest);
+        if (!Object.keys(userDays).length) delete data.users[userId];
+      }
+      data.prunedOn = day;
+    }
+    return models[model];
+  });
+}
+
+function emptyUsageTotals(extra = {}) {
+  return { ...extra, requests: 0, errors: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, cost: 0 };
+}
+
+function addUsageTotals(target, [requests, errors, inputTokens, outputTokens, cost]) {
+  target.requests += requests;
+  target.errors += errors;
+  target.inputTokens += inputTokens;
+  target.outputTokens += outputTokens;
+  target.totalTokens += inputTokens + outputTokens;
+  target.cost += cost;
+}
+
+// Summary of the last `periodDays` days (today included, WIB) from one user's day map. Pure.
+// { days, from, to, totals, models: [ per model, most tokens first ], daily: [ one per day, oldest
+//   first ], trackedSince: first day with data (older usage was made before summaries existed) }
+function usageSummaryFrom(days, periodDays = 7, now = Date.now()) {
+  const span = Math.min(USAGE_DAYS_KEPT, Math.max(1, Math.floor(Number(periodDays) || 7)));
+  const source = isPlainObject(days) ? days : {};
+  const totals = emptyUsageTotals();
+  const byModel = new Map();
+  const daily = [];
+  for (let back = span - 1; back >= 0; back -= 1) {
+    const date = usageDayKey(now - back * USAGE_DAY_MS);
+    const day = emptyUsageTotals({ date });
+    const models = Object.prototype.hasOwnProperty.call(source, date) && isPlainObject(source[date]) ? source[date] : {};
+    for (const [model, raw] of Object.entries(models)) {
+      if (!Array.isArray(raw)) continue;
+      const counts = [0, 1, 2, 3, 4].map((index) => Math.max(0, Number(raw[index]) || 0));
+      if (!byModel.has(model)) byModel.set(model, emptyUsageTotals({ model }));
+      addUsageTotals(byModel.get(model), counts);
+      addUsageTotals(day, counts);
+      addUsageTotals(totals, counts);
+    }
+    daily.push(day);
+  }
+  const tracked = Object.keys(source).filter((date) => USAGE_DATE.test(date)).sort();
+  return {
+    days: span,
+    from: daily[0].date,
+    to: daily[daily.length - 1].date,
+    totals,
+    models: [...byModel.values()].sort((a, b) => b.totalTokens - a.totalTokens || b.requests - a.requests || a.model.localeCompare(b.model)),
+    daily,
+    trackedSince: tracked[0] || null,
+  };
+}
+
+function getUsageSummary(telegramId, periodDays = 7) {
+  const id = String(telegramId ?? '').trim();
+  const { users } = readUsageDaily();
+  return usageSummaryFrom(Object.prototype.hasOwnProperty.call(users, id) ? users[id] : {}, periodDays);
+}
+
+// ---------- User list (bot: Admin Panel -> Users & Top Up) ----------
+// One page of light user entries, so the bot never has to load every full user record (with
+// keys and logs) to draw a list. Most recently active first; `query` matches a Telegram ID (or
+// part of it), "@username", or part of the name / username, case-insensitive.
+const USERS_PAGE_DEFAULT = 10;
+const USERS_PAGE_MAX = 20;
+const MAX_USER_QUERY = 64;
+
+function userListEntry(user) {
+  return {
+    telegramId: String(user.telegramId),
+    firstName: user.firstName || '',
+    username: user.username || '',
+    balance: Number(user.balance || 0),
+    bonusTokens: Number(user.bonusTokens || 0),
+    requests: Number(user.stats?.requests || 0),
+    activeKeys: (Array.isArray(user.apiKeys) ? user.apiKeys : []).filter((entry) => entry.active !== false).length,
+    createdAt: user.createdAt || null,
+    lastUsedAt: user.lastUsedAt || null,
+  };
+}
+
+function userMatchRank(user, query) {
+  const id = String(user.telegramId);
+  const username = String(user.username || '').toLowerCase();
+  const name = String(user.firstName || '').toLowerCase();
+  if (query.startsWith('@')) {
+    const handle = query.slice(1);
+    if (!handle) return -1;
+    if (username === handle) return 0;
+    return username.includes(handle) ? 1 : -1;
+  }
+  if (/^\d+$/.test(query)) {
+    if (id === query) return 0;
+    return id.includes(query) ? 1 : -1;
+  }
+  if (username === query || name === query) return 0;
+  return username.includes(query) || name.includes(query) ? 1 : -1;
+}
+
+function listUsersPage({ page = 0, pageSize = USERS_PAGE_DEFAULT, query = '' } = {}) {
+  const size = Math.min(USERS_PAGE_MAX, Math.max(1, Math.floor(Number(pageSize) || USERS_PAGE_DEFAULT)));
+  const text = String(query ?? '').trim().toLowerCase().slice(0, MAX_USER_QUERY);
+  const activity = (user) => String(user.lastUsedAt || user.createdAt || '');
+  const ranked = Object.values(readDatabase().users || {})
+    .filter((user) => user && user.telegramId)
+    .map((user) => ({ user, rank: text ? userMatchRank(user, text) : 1 }))
+    .filter((item) => item.rank >= 0)
+    .sort((a, b) => a.rank - b.rank || activity(b.user).localeCompare(activity(a.user)));
+  const pages = Math.max(1, Math.ceil(ranked.length / size));
+  const current = Math.min(pages - 1, Math.max(0, Math.floor(Number(page) || 0)));
+  return {
+    total: ranked.length,
+    page: current,
+    pages,
+    pageSize: size,
+    query: text,
+    users: ranked.slice(current * size, (current + 1) * size).map((item) => userListEntry(item.user)),
+  };
+}
+
 module.exports = { ensureUser, setUserLanguage, SUPPORTED_LANGUAGES, createApiKey, findUserByApiKey, recordUsage, getUser, getAllUsers, recordAdminRequest, getAdminLogs, addBalance, adjustBalance, getOrder, revokeApiKey, createOrder, settleOrder, createRedeemCode, redeemCode, listRedeemCodes, disableRedeemCode, normalizeRedeemCode, getAdminStats, resetStats, databasePath,
   createAccessCode, redeemAccessCode, listAccessCodes, getAccessCode, disableAccessCode, getModelAccess, modelAccessFor,
   ACCESS_CODE_PATTERN, MAX_ACCESS_MODELS, MAX_ACCESS_PERIOD_MS, MAX_ACCESS_AHEAD_MS, DEFAULT_ACCESS_REDEEM_WINDOW_MS,
@@ -1507,5 +1735,4 @@ module.exports = { ensureUser, setUserLanguage, SUPPORTED_LANGUAGES, createApiKe
   createTicket, addTicketMessage, linkAdminMessage, findTicketByAdminMessage, getTicket, getOpenTicketForUser, listTickets, countOpenTickets, closeTicket,
   createPoll, votePoll, getPoll, listPolls, closePoll, setPollSent,
   recordPrompt, listPromptUsers, getUserPrompts, clearPrompts, clearAllPrompts, promptLogPath,
-  recordModerationBlock, addModerationStats, listModerationBlocks, getModerationBlock, clearModerationBlocks, moderationLogPath,
-  DatabaseBusyError, isDatabaseBusyError };
+  recordModerationBlock, addModerationStats, listModerationBlocks, getModerationBlock, clearModerationBlocks, moderationLogPath };

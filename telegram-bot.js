@@ -8,6 +8,7 @@ const {
   adjustBalance, ensureUser, setUserLanguage, createApiKey, getAdminLogs, getAllUsers, getUser, getOrder, revokeApiKey, createOrder, settleOrder,
   createRedeemCode, redeemCode, listRedeemCodes, disableRedeemCode, getAdminStats, resetStats,
   createAccessCode, redeemAccessCode, listAccessCodes, getAccessCode, disableAccessCode, getModelAccess,
+  getUsageSummary, listUsersPage,
   addTicketMessage, closeTicket, countOpenTickets, createTicket, findTicketByAdminMessage, getOpenTicketForUser,
   getTicket, linkAdminMessage, listTickets,
   createPoll, votePoll, getPoll, listPolls, closePoll, setPollSent,
@@ -56,6 +57,10 @@ const pendingAdminBansos = new Map();
 const accessCodeDrafts = new Map();
 // Admin typing a value for that draft: 'duration', 'expires', 'start' or 'end'.
 const pendingAdminAccess = new Map();
+// Admins whose next message is a user search (Admin Panel -> Users & Top Up -> Search).
+const pendingAdminUserSearch = new Set();
+// Last user list page and search per admin, so "Back" from a user's page returns to it.
+const adminUserListState = new Map();
 // Poll announcement wizard: admins whose next message is the poll text, and the parsed
 // draft ({ question, options }) waiting for "Send". The draft survives button presses.
 const pendingAdminPoll = new Set();
@@ -86,6 +91,7 @@ function clearPendingInput(userId) {
   pendingAdminReferral.delete(id);
   pendingAdminBansos.delete(id);
   pendingAdminAccess.delete(id);
+  pendingAdminUserSearch.delete(id);
   pendingAdminPoll.delete(id);
 }
 
@@ -128,7 +134,11 @@ async function telegram(method, payload = {}) {
       }
       return telegram(method, { ...payload, reply_markup: withoutMiniAppButton(payload.reply_markup) });
     }
-    throw new Error(description);
+    const error = new Error(description);
+    // Used by the broadcast: 403 = blocked / deleted account, 429 = slow down for retryAfter seconds.
+    error.code = Number(result.error_code || response.status) || 0;
+    if (result.parameters?.retry_after) error.retryAfter = Number(result.parameters.retry_after);
+    throw error;
   }
   return result.result;
 }
@@ -207,10 +217,10 @@ function menuKeyboard(userId = '') {
 
 function dashboardKeyboard() {
   return { inline_keyboard: [
-    [{ text: '\u{1F9FE} Logs', callback_data: 'logs' }, { text: '\u{1F5D1}\u{FE0F} Revoke API Key', callback_data: 'revoke' }],
+    [{ text: '\u{1F9FE} Logs', callback_data: 'logs' }, { text: '\u{1F4C8} Usage Summary', callback_data: 'usage' }],
     [{ text: '\u{1F4B0} Model Price', callback_data: 'model_price' }, { text: '\u{1F4B3} Top Up Saldo', callback_data: 'top_up' }],
-    [{ text: '\u{1F511} Create new API key', callback_data: 'create_key' }, { text: '\u{1F3AB} Create a Ticket', callback_data: 'ticket' }],
-    [{ text: '\u{1F519} Back to menu', callback_data: 'menu' }],
+    [{ text: '\u{1F511} Create new API key', callback_data: 'create_key' }, { text: '\u{1F5D1}\u{FE0F} Revoke API Key', callback_data: 'revoke' }],
+    [{ text: '\u{1F3AB} Create a Ticket', callback_data: 'ticket' }, { text: '\u{1F519} Back to menu', callback_data: 'menu' }],
   ] };
 }
 
@@ -290,7 +300,7 @@ async function adminKeyboard() {
       callback_data: 'admin_mod',
     }],
     // Balance & codes
-    [{ text: '\u{1F39F}\u{FE0F} Redeem Codes', callback_data: 'admin_redeem' }, { text: '\u{1F4B3} Top Up User', callback_data: 'admin_topup' }],
+    [{ text: '\u{1F39F}\u{FE0F} Redeem Codes', callback_data: 'admin_redeem' }, { text: '\u{1F464} Users & Top Up', callback_data: 'admin_topup' }],
     [{ text: '\u{1F510} Kode Akses Model', callback_data: 'admin_mac' }],
     // Settings & broadcast
     [
@@ -378,23 +388,513 @@ async function adminTopUsersMessage() {
   return `\u{1F465} <b>Top Users</b> (by tokens)\n\n${lines.join('\n\n')}`;
 }
 
-async function adminUsersKeyboard() {
-  const users = await getAllUsers();
-  const rows = users.map((user) => [{
-    text: `\u{1F464} ${user.firstName || user.username || user.telegramId} — Rp${Number(user.balance || 0).toLocaleString('id-ID')}`,
+// ---------- Admin: Users & Top Up ----------
+// A paged user list (most recently active first) with search, and one page per user with
+// everything about them plus the top-up buttons. The API server builds the pages (listUsersPage),
+// so the bot never loads every full user record just to draw a list. Names and usernames are user
+// input: always escaped.
+const USER_LIST_PAGE_SIZE = 10;
+const USER_SEARCH_MAX = 64;
+const USER_ID_PATTERN = /^\d{1,20}$/;
+const TOPUP_PRESETS = [10_000, 50_000, 100_000, 500_000];
+
+function userDisplayName(user) {
+  return clipChars(String(user.firstName || (user.username ? `@${user.username}` : '') || `ID ${user.telegramId}`), 40);
+}
+
+// Same result shape as usage-db.js listUsersPage, for an API server without it yet.
+function localUsersPage(users, { page = 0, pageSize = USER_LIST_PAGE_SIZE, query = '' } = {}) {
+  const text = String(query || '').trim().toLowerCase();
+  const handle = text.replace(/^@/, '');
+  const activity = (user) => String(user.lastUsedAt || user.createdAt || '');
+  const list = users
+    .filter((user) => user && user.telegramId)
+    .filter((user) => !handle || String(user.telegramId).includes(handle)
+      || String(user.username || '').toLowerCase().includes(handle) || String(user.firstName || '').toLowerCase().includes(handle))
+    .sort((a, b) => activity(b).localeCompare(activity(a)));
+  const pages = Math.max(1, Math.ceil(list.length / pageSize));
+  const current = Math.min(pages - 1, Math.max(0, Number(page) || 0));
+  return {
+    total: list.length,
+    page: current,
+    pages,
+    pageSize,
+    query: text,
+    users: list.slice(current * pageSize, (current + 1) * pageSize).map((user) => ({
+      telegramId: String(user.telegramId),
+      firstName: user.firstName || '',
+      username: user.username || '',
+      balance: Number(user.balance || 0),
+      requests: Number(user.stats?.requests || 0),
+      lastUsedAt: user.lastUsedAt || null,
+      createdAt: user.createdAt || null,
+    })),
+  };
+}
+
+async function fetchUsersPage(options) {
+  try {
+    return await listUsersPage({ pageSize: USER_LIST_PAGE_SIZE, ...options });
+  } catch (error) {
+    console.error('[users] listUsersPage unavailable, listing locally:', error.message);
+    return localUsersPage(await getAllUsers(), { pageSize: USER_LIST_PAGE_SIZE, ...options });
+  }
+}
+
+function userListState(adminId) {
+  return adminUserListState.get(String(adminId)) || { page: 0, query: '' };
+}
+
+async function adminUserListView(adminId, notice = '') {
+  const state = userListState(adminId);
+  const result = await fetchUsersPage({ page: state.page, query: state.query });
+  adminUserListState.set(String(adminId), { page: result.page, query: state.query });
+  const first = result.page * result.pageSize;
+  const lines = [
+    ...(notice ? [notice, ''] : []),
+    '\u{1F464} <b>Users &amp; Top Up</b>',
+    state.query
+      ? `\u{1F50D} Hasil untuk <b>${escapeHtml(state.query)}</b>: <b>${formatTokens(result.total)}</b> user`
+      : `Total: <b>${formatTokens(result.total)}</b> user \u{2022} terbaru aktif di atas`,
+    DIVIDER,
+    ...(result.users.length
+      ? result.users.map((user, index) => [
+        `${first + index + 1}. <b>${escapeHtml(userDisplayName(user))}</b>${user.username && user.firstName ? ` @${escapeHtml(clipChars(user.username, 32))}` : ''} <code>${escapeHtml(user.telegramId)}</code>`,
+        `   \u{1F4B0} ${rupiah(user.balance)} \u{2022} \u{1F4E1} ${formatTokens(user.requests)} req \u{2022} \u{1F552} ${escapeHtml(user.lastUsedAt ? wibTime(user.lastUsedAt) : 'belum pernah')}`,
+      ].join('\n'))
+      : [state.query ? 'Tidak ada user yang cocok.' : 'Belum ada user.']),
+    '',
+    `<i>Halaman ${result.page + 1}/${result.pages}. Tap user untuk detail &amp; top up.</i>`,
+  ];
+  const rows = result.users.map((user, index) => [{
+    text: `${first + index + 1}. ${userDisplayName(user)} \u{2014} ${rupiah(user.balance)}`.slice(0, 60),
     callback_data: `admin_topup_user_${user.telegramId}`,
   }]);
+  if (result.pages > 1) {
+    const nav = [];
+    if (result.page > 0) nav.push({ text: '\u{25C0}\u{FE0F} Sebelumnya', callback_data: `admin_ul_p_${result.page - 1}` });
+    if (result.page < result.pages - 1) nav.push({ text: 'Berikutnya \u{25B6}\u{FE0F}', callback_data: `admin_ul_p_${result.page + 1}` });
+    rows.push(nav);
+  }
+  rows.push(state.query
+    ? [{ text: '\u{1F50D} Cari lagi', callback_data: 'admin_ul_search' }, { text: '\u{2716}\u{FE0F} Hapus pencarian', callback_data: 'admin_ul_clear' }]
+    : [{ text: '\u{1F50D} Cari user (ID / @username / nama)', callback_data: 'admin_ul_search' }]);
   rows.push([{ text: '\u{1F519} Back to admin panel', callback_data: 'admin_panel' }]);
+  return { text: lines.join('\n'), reply_markup: { inline_keyboard: rows } };
+}
+
+// "sk-user-1a2b…9z8y": enough to tell keys apart, not enough to use one.
+function maskApiKey(key) {
+  const value = String(key || '');
+  return value.length > 16 ? `${value.slice(0, 12)}\u{2026}${value.slice(-4)}` : '\u{2026}';
+}
+
+function userLogLine(entry) {
+  const total = Number(entry.inputTokens || 0) + Number(entry.outputTokens || 0);
+  const model = escapeHtml(clipChars(stripModelPrefix(entry.model) || 'unknown', 32));
+  // "2026-10-04 15:48:09" -> "04/10 15:48" (WIB).
+  const time = wibLogTime(entry.at);
+  const when = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(time) ? `${time.slice(8, 10)}/${time.slice(5, 7)} ${time.slice(11, 16)}` : time;
+  return `${entry.status >= 400 ? '\u{274C}' : '\u{2705}'} ${escapeHtml(when)} <code>${model}</code> \u{2022} ${formatTokens(total)} tok${entry.estimated ? ' (est.)' : ''} \u{2022} ${formatCost(entry.cost)}`;
+}
+
+function adminUserKeyboard(user, { ticket, access } = {}) {
+  const id = user.telegramId;
+  const preset = (amount) => ({ text: `+${rupiah(amount)}`, callback_data: `admin_topup_amount_${id}_${amount}` });
+  const rows = [
+    [preset(TOPUP_PRESETS[0]), preset(TOPUP_PRESETS[1])],
+    [preset(TOPUP_PRESETS[2]), preset(TOPUP_PRESETS[3])],
+    [{ text: '\u{270F}\u{FE0F} Tambah / kurangi (custom)', callback_data: `admin_topup_custom_${id}` }],
+    [{ text: '\u{1F4C8} Pemakaian 30 hari', callback_data: `admin_uu_${id}_30` }, { text: '\u{1F4AC} Prompts', callback_data: `admin_prompts_u_${id}` }],
+  ];
+  if (ticket) rows.push([{ text: `\u{1F3AB} Ticket #${ticket.id} (terbuka)`, callback_data: `admin_ticket_view_${ticket.id}` }]);
+  for (const grant of [...(access?.active || []), ...(access?.scheduled || [])].slice(0, 2)) {
+    rows.push([{ text: `\u{1F510} ${grant.code}`, callback_data: `admin_mac_v_${grant.code}` }]);
+  }
+  rows.push([{ text: '\u{1F504} Refresh', callback_data: `admin_topup_user_${id}` }, { text: '\u{1F519} Daftar user', callback_data: 'admin_ul_back' }]);
   return { inline_keyboard: rows };
 }
 
-function adminTopupAmounts(userId) {
-  return { inline_keyboard: [
-    [{ text: 'Rp10.000', callback_data: `admin_topup_amount_${userId}_10000` }, { text: 'Rp50.000', callback_data: `admin_topup_amount_${userId}_50000` }],
-    [{ text: 'Rp100.000', callback_data: `admin_topup_amount_${userId}_100000` }, { text: 'Rp500.000', callback_data: `admin_topup_amount_${userId}_500000` }],
-    [{ text: '\u{270F}\u{FE0F} Custom amount', callback_data: `admin_topup_custom_${userId}` }],
-    [{ text: '\u{1F519} Back to users', callback_data: 'admin_topup' }],
-  ] };
+// Everything about one user on one screen. Newer data (access codes, usage summary, tickets) is
+// left out when the API server does not have it yet.
+async function adminUserDetailView(targetId, notice = '') {
+  const user = USER_ID_PATTERN.test(String(targetId)) ? await getUser(targetId) : null;
+  if (!user) return null;
+  const id = String(user.telegramId);
+  const [access, week, ticket] = await Promise.all([
+    getModelAccess(id).catch(() => null),
+    getUsageSummary(id, 7).catch(() => null),
+    getOpenTicketForUser(id).catch(() => null),
+  ]);
+  const stats = user.stats || {};
+  const requests = Number(stats.requests || 0);
+  const errors = Number(stats.errors || 0);
+  const keys = Array.isArray(user.apiKeys) ? user.apiKeys : [];
+  const activeKeys = keys.filter((entry) => entry.active !== false);
+  const orders = Array.isArray(user.orders) ? user.orders : [];
+  const settled = orders.filter((order) => order.status === 'SETTLED');
+  const pending = orders.filter((order) => order.status === 'PENDING').length;
+  const referral = user.referralStats || {};
+  const language = { id: 'Indonesia', en: 'English' }[user.language] || '-';
+  const logs = (Array.isArray(user.logs) ? user.logs : []).slice(-5).reverse();
+  const grants = [...(access?.active || []), ...(access?.scheduled || [])];
+
+  const lines = [
+    ...(notice ? [notice, ''] : []),
+    `\u{1F464} <b>${escapeHtml(userDisplayName(user))}</b>${user.username ? ` @${escapeHtml(clipChars(user.username, 32))}` : ''}`,
+    `\u{1F194} <code>${escapeHtml(id)}</code> \u{2022} \u{1F310} ${language}`,
+    `\u{1F4C5} Bergabung: ${escapeHtml(wibTime(user.createdAt))}`,
+    `\u{1F552} Terakhir pakai API: ${escapeHtml(user.lastUsedAt ? wibTime(user.lastUsedAt) : 'belum pernah')}`,
+    '',
+    card('\u{1F4B3} <b>Saldo</b>', [
+      `Saldo: <b>${rupiah(user.balance)}</b>`,
+      Number(user.bonusTokens || 0) > 0 && `Bonus token: <b>${bigNumber(user.bonusTokens)}</b>`,
+      `Total terpakai: <b>${formatCost(stats.spent)}</b>`,
+      `Top up lunas: <b>${rupiah(settled.reduce((sum, order) => sum + Number(order.amount || 0), 0))}</b> (${formatTokens(settled.length)}x)${pending ? ` \u{2022} ${formatTokens(pending)} pending` : ''}`,
+    ]),
+    card('\u{1F4C8} <b>Pemakaian</b>', [
+      `Total: <b>${formatTokens(requests)}</b> req (\u{26A0}\u{FE0F} ${formatTokens(errors)} error) \u{2022} <b>${bigNumber(stats.totalTokens)}</b> token`,
+      week && `7 hari: <b>${formatTokens(week.totals.requests)}</b> req \u{2022} <b>${bigNumber(week.totals.totalTokens)}</b> token \u{2022} <b>${formatCost(week.totals.cost)}</b>`,
+      week && week.models.length && `Model teratas (7 hari): ${week.models.slice(0, 3).map((entry) => `<code>${escapeHtml(entry.model)}</code>`).join(' \u{2022} ')}`,
+    ]),
+    card('\u{1F511} <b>API key</b>', [
+      `Aktif: <b>${formatTokens(activeKeys.length)}</b> dari ${formatTokens(keys.length)}`,
+      ...activeKeys.slice(0, 3).map((entry) => `<code>${escapeHtml(maskApiKey(entry.key))}</code> \u{2022} ${escapeHtml(wibTime(entry.createdAt))}`),
+      activeKeys.length > 3 && `+${formatTokens(activeKeys.length - 3)} key lainnya`,
+    ]),
+  ];
+  if (grants.length) {
+    lines.push(card('\u{1F510} <b>Kode akses model</b>', grants.slice(0, 4).map((grant) => (grant.status === 'active'
+      ? `<code>${escapeHtml(grant.code)}</code> s/d ${escapeHtml(wibTime(grant.endsAt))}: ${accessModelsText(grant.models, 3)}`
+      : `\u{23F3} <code>${escapeHtml(grant.code)}</code> mulai ${escapeHtml(wibTime(grant.startsAt))}: ${accessModelsText(grant.models, 3)}`))));
+  }
+  lines.push(card('\u{1F91D} <b>Referral</b>', [
+    `Diundang oleh: ${user.referredBy?.telegramId ? `<code>${escapeHtml(user.referredBy.telegramId)}</code>` : '-'}`,
+    `Mengundang: <b>${formatTokens(referral.invites || 0)}</b> (dibayar ${formatTokens(referral.rewarded || 0)}) \u{2022} ${bigNumber(referral.tokensEarned || 0)} token`,
+  ]));
+  if (ticket) lines.push(`\u{1F3AB} Ticket terbuka: <b>#${escapeHtml(ticket.id)}</b>`);
+  lines.push(card('\u{1F9FE} <b>Request terakhir</b>', logs.length ? logs.map(userLogLine) : ['Belum ada.']));
+  return { text: lines.join('\n'), reply_markup: adminUserKeyboard(user, { ticket, access }) };
+}
+
+// Sends the user's page (or the list with a notice when the user is gone).
+async function sendAdminUserDetail(chatId, adminId, targetId, notice = '') {
+  const view = await adminUserDetailView(targetId, notice);
+  const shown = view || await adminUserListView(adminId, '\u{274C} User tidak ditemukan.');
+  return telegram('sendMessage', { chat_id: chatId, text: shown.text, parse_mode: 'HTML', reply_markup: shown.reply_markup });
+}
+
+// Typed search: one match opens that user's page right away, otherwise the list of matches.
+async function handleUserSearchInput(chatId, adminId, text) {
+  const query = String(text || '').trim().slice(0, USER_SEARCH_MAX);
+  if (!query) return telegram('sendMessage', { chat_id: chatId, text: '\u{274C} Kirim ID, @username atau nama user.' });
+  pendingAdminUserSearch.delete(String(adminId));
+  adminUserListState.set(String(adminId), { page: 0, query });
+  const result = await fetchUsersPage({ page: 0, query });
+  if (result.total === 1) return sendAdminUserDetail(chatId, adminId, result.users[0].telegramId);
+  const view = await adminUserListView(adminId);
+  return telegram('sendMessage', { chat_id: chatId, text: view.text, parse_mode: 'HTML', reply_markup: view.reply_markup });
+}
+
+// ---------- Usage summary (API Dashboard -> Usage Summary, /usage; admin user page) ----------
+// Per model and per day (WIB) from usage-db.js getUsageSummary. Counting started when the summary
+// was added, so older usage only shows in the totals on the dashboard.
+const USAGE_PERIODS = [1, 7, 30];
+const USAGE_MODELS_SHOWN = 8;
+const USAGE_TEXT = {
+  id: {
+    title: 'RINGKASAN PEMAKAIAN',
+    periods: { 1: 'Hari ini', 7: '7 hari', 30: '30 hari' },
+    total: 'Total',
+    requests: 'request',
+    errors: 'error',
+    tokens: 'token',
+    cost: 'Biaya',
+    perModel: 'Per model',
+    perDay: 'Per hari',
+    average: 'Rata-rata per hari',
+    busiest: 'Hari tersibuk',
+    none: 'Belum ada pemakaian di periode ini. \u{1F4ED}',
+    since: (day) => `Ringkasan tercatat sejak ${day}; pemakaian sebelumnya tidak termasuk.`,
+    more: (count) => `+${count} model lainnya`,
+    locale: 'id-ID',
+    logs: '\u{1F9FE} Logs',
+    back: '\u{1F519} Back to dashboard',
+    unavailable: '\u{26A0}\u{FE0F} Ringkasan pemakaian belum tersedia di server. Coba lagi nanti.',
+  },
+  en: {
+    title: 'USAGE SUMMARY',
+    periods: { 1: 'Today', 7: '7 days', 30: '30 days' },
+    total: 'Total',
+    requests: 'requests',
+    errors: 'errors',
+    tokens: 'tokens',
+    cost: 'Cost',
+    perModel: 'Per model',
+    perDay: 'Per day',
+    average: 'Daily average',
+    busiest: 'Busiest day',
+    none: 'No usage in this period yet. \u{1F4ED}',
+    since: (day) => `The summary is recorded since ${day}; earlier usage is not included.`,
+    more: (count) => `+${count} more models`,
+    locale: 'en-GB',
+    logs: '\u{1F9FE} Logs',
+    back: '\u{1F519} Back to dashboard',
+    unavailable: '\u{26A0}\u{FE0F} The usage summary is not available on the server yet. Please try again later.',
+  },
+};
+
+// "2026-10-03" -> "Sab, 03 Okt" / "Sat, 03 Oct" (the date is already a WIB day).
+function usageDayLabel(date, locale, withWeekday = true) {
+  const [year, month, day] = String(date).split('-').map(Number);
+  return new Date(Date.UTC(year, month - 1, day)).toLocaleDateString(locale, {
+    timeZone: 'UTC', day: '2-digit', month: 'short', ...(withWeekday ? { weekday: 'short' } : {}),
+  });
+}
+
+// `options` = { lang, days, periodData (callback prefix), back: [buttons], heading? }.
+function usageSummaryView(summary, { lang = DEFAULT_LANGUAGE, days = 7, periodData = 'usage_', back = [], heading = '' } = {}) {
+  const t = USAGE_TEXT[lang] || USAGE_TEXT[DEFAULT_LANGUAGE];
+  const periodRow = USAGE_PERIODS.map((period) => ({
+    text: `${period === days ? '\u{2705} ' : ''}${t.periods[period]}`,
+    callback_data: `${periodData}${period}`,
+  }));
+  const keyboard = { inline_keyboard: [periodRow, ...(back.length ? [back] : [])] };
+  if (!summary) return { text: t.unavailable, reply_markup: keyboard };
+  const totals = summary.totals;
+  const range = summary.days === 1
+    ? usageDayLabel(summary.to, t.locale)
+    : `${usageDayLabel(summary.from, t.locale, false)} \u{2013} ${usageDayLabel(summary.to, t.locale, false)}`;
+  const lines = [
+    `\u{1F4C8} <b>${t.title}</b> \u{2014} ${t.periods[days] || `${summary.days}d`}`,
+    ...(heading ? [heading] : []),
+    `<i>${escapeHtml(range)} (WIB)</i>`,
+    DIVIDER,
+  ];
+  if (!totals.requests) {
+    lines.push(t.none);
+  } else {
+    lines.push(card(`\u{1F9EE} <b>${t.total}</b>`, [
+      `\u{1F4E8} <b>${formatTokens(totals.requests)}</b> ${t.requests}${totals.errors ? ` (\u{26A0}\u{FE0F} ${formatTokens(totals.errors)} ${t.errors})` : ''}`,
+      `\u{1F4E5} ${bigNumber(totals.inputTokens)} \u{2022} \u{1F4E4} ${bigNumber(totals.outputTokens)}`,
+      `\u{1F522} <b>${bigNumber(totals.totalTokens)}</b> ${t.tokens}`,
+      `\u{1F4B8} ${t.cost}: <b>${formatCost(totals.cost)}</b>`,
+    ]));
+    const byTokens = totals.totalTokens > 0;
+    const modelLines = summary.models.slice(0, USAGE_MODELS_SHOWN).map((entry) => {
+      const share = byTokens ? (entry.totalTokens / totals.totalTokens) * 100 : (entry.requests / totals.requests) * 100;
+      return [
+        `<code>${escapeHtml(entry.model)}</code> ${progressBar(share, 8)} <b>${share.toFixed(share < 10 ? 1 : 0)}%</b>`,
+        `   ${formatTokens(entry.requests)} req \u{2022} ${bigNumber(entry.totalTokens)} tok \u{2022} ${formatCost(entry.cost)}`,
+      ].join('\n');
+    });
+    if (summary.models.length > USAGE_MODELS_SHOWN) modelLines.push(`<i>${t.more(summary.models.length - USAGE_MODELS_SHOWN)}</i>`);
+    lines.push('', `\u{1F916} <b>${t.perModel}</b>`, ...modelLines);
+    const activeDays = summary.daily.filter((day) => day.requests > 0);
+    if (summary.days === 7) {
+      const peak = Math.max(1, ...summary.daily.map((day) => day.totalTokens));
+      lines.push('', `\u{1F4C5} <b>${t.perDay}</b>`, ...summary.daily.map((day) => (day.requests
+        ? `<code>${escapeHtml(usageDayLabel(day.date, t.locale))}</code> ${progressBar((day.totalTokens / peak) * 100, 6)} ${shortNumber(day.totalTokens)} tok \u{2022} ${formatCost(day.cost)}`
+        : `<code>${escapeHtml(usageDayLabel(day.date, t.locale))}</code> \u{2014}`)));
+    } else if (summary.days > 7 && activeDays.length) {
+      const busiest = activeDays.reduce((best, day) => (day.totalTokens > best.totalTokens ? day : best));
+      lines.push('', card(`\u{1F4C5} <b>${t.perDay}</b>`, [
+        `${t.average}: <b>${bigNumber(Math.round(totals.totalTokens / summary.days))}</b> tok \u{2022} ${formatCost(totals.cost / summary.days)}`,
+        `${t.busiest}: <b>${escapeHtml(usageDayLabel(busiest.date, t.locale))}</b> \u{2022} ${bigNumber(busiest.totalTokens)} tok \u{2022} ${formatCost(busiest.cost)}`,
+      ]));
+    }
+  }
+  if (!summary.trackedSince || summary.trackedSince > summary.from) {
+    lines.push('', `<i>${escapeHtml(t.since(summary.trackedSince ? usageDayLabel(summary.trackedSince, t.locale, false) : usageDayLabel(summary.to, t.locale, false)))}</i>`);
+  }
+  return { text: lines.join('\n'), reply_markup: keyboard };
+}
+
+async function userUsageView(telegramId, days) {
+  const account = await getUser(telegramId).catch(() => null);
+  const lang = userLanguage(account);
+  const t = USAGE_TEXT[lang] || USAGE_TEXT[DEFAULT_LANGUAGE];
+  const summary = await getUsageSummary(telegramId, days).catch((error) => {
+    console.error('[usage] summary failed:', error.message);
+    return null;
+  });
+  return usageSummaryView(summary, {
+    lang,
+    days,
+    periodData: 'usage_',
+    back: [{ text: t.logs, callback_data: 'logs' }, { text: t.back, callback_data: 'dashboard' }],
+  });
+}
+
+async function adminUserUsageView(targetId, days) {
+  const user = USER_ID_PATTERN.test(String(targetId)) ? await getUser(targetId) : null;
+  if (!user) return null;
+  const summary = await getUsageSummary(user.telegramId, days).catch(() => null);
+  return usageSummaryView(summary, {
+    lang: 'id',
+    days,
+    periodData: `admin_uu_${user.telegramId}_`,
+    heading: `\u{1F464} <b>${escapeHtml(userDisplayName(user))}</b> <code>${escapeHtml(user.telegramId)}</code>`,
+    back: [{ text: '\u{1F519} Detail user', callback_data: `admin_topup_user_${user.telegramId}` }],
+  });
+}
+
+// ---------- Broadcast (announcements and polls) ----------
+// Sends one message per user in the background, so the bot keeps answering everyone meanwhile.
+// Telegram allows about 30 messages per second per bot; broadcasts use at most 20, leaving room
+// for normal replies. A 429 pauses every sender for the retry_after Telegram asks for, and the
+// message is retried. Users who blocked the bot or deleted their account are counted apart.
+// One broadcast runs at a time; a second one waits for it. A restart stops a running broadcast.
+const BROADCAST_INTERVAL_MS = 50; // 20 messages per second
+const BROADCAST_WORKERS = 5;
+const BROADCAST_MAX_ATTEMPTS = 4;
+const BROADCAST_PROGRESS_MS = 3000;
+const BROADCAST_ERRORS_KEPT = 3;
+let broadcastNextSlot = 0;
+let broadcastChain = Promise.resolve();
+let broadcastsPending = 0;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Waits for this sender's turn under the shared rate limit.
+async function broadcastSlot() {
+  for (;;) {
+    const now = Date.now();
+    if (now >= broadcastNextSlot) {
+      broadcastNextSlot = now + BROADCAST_INTERVAL_MS;
+      return;
+    }
+    await sleep(broadcastNextSlot - now);
+  }
+}
+
+function sendErrorKind(error) {
+  const code = Number(error?.code) || 0;
+  const text = String(error?.message || '');
+  if (code === 429) return 'rate_limited';
+  if (code === 403 || /bot was blocked|user is deactivated|bot was kicked/i.test(text)) return 'unreachable';
+  if (code === 400 && /chat not found|user not found|peer_id_invalid/i.test(text)) return 'unreachable';
+  if (!code || code >= 500) return 'transient';
+  return 'failed';
+}
+
+// 'sent', 'unreachable' or { failed: error }.
+async function deliverBroadcast(recipient, send) {
+  for (let attempt = 1; ; attempt += 1) {
+    await broadcastSlot();
+    try {
+      await send(recipient);
+      return 'sent';
+    } catch (error) {
+      const kind = sendErrorKind(error);
+      if (kind === 'unreachable') return 'unreachable';
+      if (kind === 'failed' || attempt >= BROADCAST_MAX_ATTEMPTS) return { failed: error };
+      if (kind === 'rate_limited') {
+        // Flood control is per bot, so every sender waits.
+        broadcastNextSlot = Math.max(broadcastNextSlot, Date.now() + (Number(error.retryAfter) || 5) * 1000 + 250);
+      } else {
+        await sleep(1000 * attempt);
+      }
+    }
+  }
+}
+
+// Calls job.report(stats) one at a time, newest state each time; the final report always runs last.
+function broadcastReporter(job, stats) {
+  let chain = Promise.resolve();
+  let busy = false;
+  return (final = false) => {
+    if (busy && !final) return chain;
+    busy = true;
+    const snapshot = { ...stats, errors: [...stats.errors] };
+    chain = chain
+      .then(() => job.report(snapshot))
+      .catch((error) => console.error(`[broadcast] ${job.label}: status update failed: ${error.message}`))
+      .then(() => { busy = false; });
+    return chain;
+  };
+}
+
+async function runBroadcast(job, stats, report) {
+  stats.queued = false;
+  stats.startedAt = Date.now();
+  report();
+  const progress = setInterval(() => report(), BROADCAST_PROGRESS_MS);
+  let next = 0;
+  const worker = async () => {
+    while (next < job.recipients.length) {
+      const recipient = job.recipients[next];
+      next += 1;
+      const outcome = await deliverBroadcast(recipient, job.send);
+      if (outcome === 'sent') {
+        stats.sent += 1;
+      } else if (outcome === 'unreachable') {
+        stats.unreachable += 1;
+      } else {
+        stats.failed += 1;
+        const reason = clipChars(String(outcome.failed?.message || 'unknown error'), 120);
+        if (stats.errors.length < BROADCAST_ERRORS_KEPT && !stats.errors.includes(reason)) stats.errors.push(reason);
+        console.error(`[broadcast] ${job.label} -> ${recipient.telegramId}: ${reason}`);
+      }
+    }
+  };
+  try {
+    await Promise.all(Array.from({ length: Math.min(BROADCAST_WORKERS, Math.max(1, job.recipients.length)) }, worker));
+  } finally {
+    clearInterval(progress);
+  }
+  stats.done = true;
+  stats.finishedAt = Date.now();
+  console.log(`[broadcast] ${job.label}: ${stats.sent} sent, ${stats.unreachable} unreachable, ${stats.failed} failed of ${stats.total}`);
+  await report(true);
+}
+
+// job = { label, recipients: [{ telegramId, ... }], send(recipient), report(stats) }. Returns at once.
+function startBroadcast(job) {
+  const stats = {
+    total: job.recipients.length, sent: 0, unreachable: 0, failed: 0, errors: [],
+    queued: broadcastsPending > 0, done: false, startedAt: null, finishedAt: null,
+  };
+  const report = broadcastReporter(job, stats);
+  broadcastsPending += 1;
+  report();
+  broadcastChain = broadcastChain
+    .then(() => runBroadcast(job, stats, report))
+    .catch((error) => console.error(`[broadcast] ${job.label} stopped:`, error.message))
+    .finally(() => { broadcastsPending -= 1; });
+  return stats;
+}
+
+function broadcastDuration(stats) {
+  const seconds = Math.max(0, Math.round(((stats.finishedAt || Date.now()) - (stats.startedAt || Date.now())) / 1000));
+  return seconds >= 60 ? `${Math.floor(seconds / 60)}m ${seconds % 60}s` : `${seconds}s`;
+}
+
+// Status text for the admin: progress while sending, the report when done. `title` is trusted HTML.
+function broadcastStatusText(title, stats) {
+  const processed = stats.sent + stats.unreachable + stats.failed;
+  const percent = stats.total ? (processed / stats.total) * 100 : 100;
+  const state = stats.done ? '\u{2705} done' : stats.queued ? '\u{23F3} waiting for the previous broadcast' : '\u{1F4E4} sending\u{2026}';
+  return [
+    `${title} \u{2014} ${state}`,
+    `${progressBar(percent)} <b>${percent.toFixed(0)}%</b> (${formatTokens(processed)}/${formatTokens(stats.total)})`,
+    '',
+    `\u{2705} Delivered: <b>${formatTokens(stats.sent)}</b>`,
+    `\u{1F6AB} Unreachable (blocked the bot / deleted account): <b>${formatTokens(stats.unreachable)}</b>`,
+    `\u{274C} Failed: <b>${formatTokens(stats.failed)}</b>`,
+    ...(stats.startedAt ? [`\u{23F1}\u{FE0F} ${broadcastDuration(stats)}`] : []),
+    ...(stats.errors.length ? ['', '<i>Errors:</i>', ...stats.errors.map((reason) => `\u{2022} <code>${escapeHtml(reason)}</code>`)] : []),
+    ...(stats.done ? [] : ['', '<i>The bot keeps working normally while this runs.</i>']),
+  ].join('\n');
+}
+
+// Edits a status message; progress edits that fail are only logged (never a new message).
+async function editStatusMessage(chatId, messageId, text, replyMarkup) {
+  try {
+    await telegram('editMessageText', { chat_id: chatId, message_id: messageId, text, parse_mode: 'HTML', ...(replyMarkup ? { reply_markup: replyMarkup } : {}) });
+  } catch (error) {
+    if (!/message is not modified/i.test(error.message)) throw error;
+  }
 }
 
 async function adminPanelMessage() {
@@ -645,11 +1145,12 @@ function isDisabledIn(disabled, model) {
 // `telegramId` (optional): the asking user, so an active model access code can be pointed out.
 async function modelPriceMessage(telegramId) {
   const access = telegramId ? await getModelAccess(telegramId).catch(() => null) : null;
-  const account = access?.restricted ? await getUser(telegramId).catch(() => null) : null;
-  const notice = access?.restricted ? `${modelAccessNotice(access, userLanguage(account))}\n\n` : '';
+  const account = access?.granted ? await getUser(telegramId).catch(() => null) : null;
+  const notice = access?.granted ? `${modelAccessNotice(access, userLanguage(account))}\n\n` : '';
+  const unlocked = new Set(access?.granted ? access.models : []);
   const disabled = await getDisabledModels();
-  // Users only see models they can actually use.
-  const models = (await syncSupportedModels()).filter((model) => !isDisabledIn(disabled, model));
+  // Users only see models they can actually use: disabled ones only while their access code unlocks them.
+  const models = (await syncSupportedModels()).filter((model) => !isDisabledIn(disabled, model) || unlocked.has(model.toLowerCase()));
   const allFree = await isAllModelsFree();
   // Active BANSOS windows; an outdated API server simply has none.
   const bansos = allFree ? [] : (await listBansos().catch(() => [])).filter((entry) => entry.status === 'active');
@@ -1085,7 +1586,7 @@ async function adminModelFamiliesView() {
   const text = [
     '\u{1F6AB} <b>Disable Model</b>',
     '',
-    'Model yang di-disable tidak bisa dipakai lewat API dan disembunyikan dari daftar model user.',
+    'Model yang di-disable tidak bisa dipakai lewat API dan disembunyikan dari daftar model user, kecuali oleh user yang punya <b>Kode Akses Model</b> aktif untuk model itu.',
     '\u{1F7E2} semua aktif • \u{1F7E1} sebagian disabled • \u{1F534} family disabled',
     '',
     ...lines,
@@ -1623,10 +2124,12 @@ async function handleBansosTimeInput(chatId, userId, text) {
 // ---------- Model access codes ----------
 // Admin Panel -> Kode Akses Model. The admin picks one or more models and a period; the API server
 // stores a unique, single-use code (MDL-XXXXXX-XXXXXX). The user who redeems it (Redeem Code or
-// /redeem) may use ONLY those models while the period runs: server.js checks every request and
-// lifts the limit by itself once the period is over. Prices, balance, BANSOS, disabled models and
-// rate limits work as before. The API server checks the admin id again when a code is created or
-// disabled, so these buttons are not the only gate. Model names, codes and user names always go
+// /redeem) gets extra access while the period runs: those models stay usable for them even when
+// the admin has disabled them for everyone else (Disable Model), which makes them exclusive to
+// code holders. Every other model keeps working as usual: a code never blocks anything. server.js
+// checks every request and the extra access ends by itself once the period is over. Prices,
+// balance, BANSOS and rate limits work as before. The API server checks the admin id again when
+// a code is created or disabled, so these buttons are not the only gate. Model names, codes and user names always go
 // through escapeHtml before they are put into an HTML message.
 
 // [button label, minutes]
@@ -1682,18 +2185,18 @@ const ACCESS_USER_TEXT = {
     code: 'Kode',
     models: 'Model',
     period: 'Berlaku',
-    scheduled: (start) => `\u{23F3} Akses dimulai <b>${start}</b>. Sampai saat itu akses model kamu masih normal.`,
-    combined: 'Bersama kode akses lain yang masih aktif, model yang bisa kamu pakai sekarang',
-    rule: '\u{26A0}\u{FE0F} Selama periode ini API key kamu <b>hanya bisa memakai model di atas</b>; model lain akan ditolak. Setelah periode berakhir, akses model kembali normal otomatis.',
+    scheduled: (start) => `\u{23F3} Akses khusus dimulai <b>${start}</b>. Sampai saat itu akses model kamu masih seperti biasa.`,
+    combined: 'Bersama kode akses lain yang masih aktif, model akses khusus kamu sekarang',
+    rule: '\u{2705} Selama periode ini kamu <b>bisa memakai model di atas</b>, termasuk saat model itu sedang ditutup untuk user lain. Model lain tetap bisa dipakai seperti biasa. Setelah periode berakhir, akses khusus ini selesai otomatis.',
     billing: '\u{1F4B3} Pemakaian tetap memotong saldo / bonus token sesuai harga model.',
     tryAnother: '\u{1F501} Coba kode lain',
     back: '\u{1F519} Kembali ke menu',
     cardTitle: '\u{1F510} <b>Kode Akses Model</b>',
-    cardOnly: 'Hanya model ini yang bisa dipakai',
+    cardOnly: 'Akses khusus ke',
     cardUntil: 'sampai',
     cardStarts: 'mulai',
-    notice: (models, until) => `\u{1F510} <b>Kode akses model aktif</b> sampai ${until}: API key kamu hanya bisa memakai ${models}.`,
-    stopped: (code) => `\u{1F6D1} Akses dari kode <code>${code}</code> dihentikan oleh admin. Akses model kamu kembali normal.`,
+    notice: (models, until) => `\u{1F510} <b>Kode akses model aktif</b> sampai ${until}: kamu punya akses khusus ke ${models}. Model lain tetap bisa dipakai seperti biasa.`,
+    stopped: (code) => `\u{1F6D1} Akses khusus dari kode <code>${code}</code> dihentikan oleh admin. Akses model kamu kembali seperti biasa.`,
     more: 'lainnya',
     length: durationText,
     left: (ms) => `sisa ${durationText(ms)}`,
@@ -1711,18 +2214,18 @@ const ACCESS_USER_TEXT = {
     code: 'Code',
     models: 'Models',
     period: 'Valid',
-    scheduled: (start) => `\u{23F3} Access starts <b>${start}</b>. Until then your model access stays as usual.`,
-    combined: 'Together with your other active access codes, the models you can use now',
-    rule: '\u{26A0}\u{FE0F} During this period your API keys can <b>only use the models above</b>; other models are rejected. When the period ends, your model access goes back to normal automatically.',
+    scheduled: (start) => `\u{23F3} Your extra access starts <b>${start}</b>. Until then your model access stays as usual.`,
+    combined: 'Together with your other active access codes, your extra models now',
+    rule: '\u{2705} During this period you <b>can use the models above</b>, even while they are closed for other users. All other models keep working as usual. When the period ends, this extra access ends automatically.',
     billing: '\u{1F4B3} Usage is still charged to your balance / bonus tokens at the model price.',
     tryAnother: '\u{1F501} Try another code',
     back: '\u{1F519} Back to menu',
     cardTitle: '\u{1F510} <b>Model Access Code</b>',
-    cardOnly: 'Only these models can be used',
+    cardOnly: 'Extra access to',
     cardUntil: 'until',
     cardStarts: 'starts',
-    notice: (models, until) => `\u{1F510} <b>Model access code active</b> until ${until}: your API keys can only use ${models}.`,
-    stopped: (code) => `\u{1F6D1} The access from code <code>${code}</code> was stopped by the admin. Your model access is back to normal.`,
+    notice: (models, until) => `\u{1F510} <b>Model access code active</b> until ${until}: you have extra access to ${models}. All other models work as usual.`,
+    stopped: (code) => `\u{1F6D1} The extra access from code <code>${code}</code> was stopped by the admin. Your model access is back to usual.`,
     more: 'more',
     length: durationTextEn,
     left: (ms) => `${durationTextEn(ms)} left`,
@@ -1781,12 +2284,12 @@ function accessDraftComplete(draft) {
 
 // API Dashboard card for a user's active / upcoming access codes; '' when there are none.
 function modelAccessCard(access, lang = DEFAULT_LANGUAGE) {
-  if (!access || (!access.restricted && !(access.scheduled || []).length)) return '';
+  if (!access || (!access.granted && !(access.scheduled || []).length)) return '';
   const t = accessUserText(lang);
   const now = Date.now();
   const lines = [];
-  if (access.restricted) {
-    lines.push(`\u{2705} ${t.cardOnly}: ${accessModelsText(access.allowedModels, 12, t.more)}`);
+  if (access.granted) {
+    lines.push(`\u{2705} ${t.cardOnly}: ${accessModelsText(access.models, 12, t.more)}`);
     for (const grant of access.active.slice(0, 5)) {
       lines.push(`<code>${escapeHtml(grant.code)}</code> ${t.cardUntil} ${escapeHtml(wibTime(grant.endsAt))} (${t.left(Date.parse(grant.endsAt) - now)})`);
     }
@@ -1797,10 +2300,10 @@ function modelAccessCard(access, lang = DEFAULT_LANGUAGE) {
   return card(t.cardTitle, lines);
 }
 
-// One line for screens that list models (Model Price) while a code restricts the user.
+// One line for screens that list models (Model Price) while a code gives the user extra access.
 function modelAccessNotice(access, lang = DEFAULT_LANGUAGE) {
   const t = accessUserText(lang);
-  return t.notice(accessModelsText(access.allowedModels, 12, t.more), escapeHtml(wibTime(access.restrictedUntil)));
+  return t.notice(accessModelsText(access.models, 12, t.more), escapeHtml(wibTime(access.grantedUntil)));
 }
 
 // A user sent an MDL-... code (Redeem Code button, /redeem <code>, or just the code).
@@ -1824,7 +2327,7 @@ async function performAccessRedeem(chatId, from, rawCode) {
     });
   }
   const length = Date.parse(result.endsAt) - Date.parse(result.startsAt);
-  const allowed = result.access?.allowedModels || [];
+  const allowed = result.access?.models || [];
   const lines = [
     t.title,
     '',
@@ -1860,7 +2363,9 @@ async function adminAccessCodesView(notice = '') {
     ...(notice ? [notice, ''] : []),
     '\u{1F510} <b>Kode Akses Model</b>',
     '',
-    'Kode unik <b>sekali pakai</b> yang mengikat model pilihan dan periode. User yang menukarkannya <b>hanya bisa memakai model tersebut</b> selama periode berlaku; model lain ditolak. Setelah periode selesai, akses model user kembali normal otomatis. Harga &amp; saldo tetap seperti biasa.',
+    'Kode unik <b>sekali pakai</b> yang mengikat model pilihan dan periode. Selama periode berlaku, user yang menukarkannya <b>tetap bisa memakai model tersebut walaupun model itu di-disable</b> untuk user lain, jadi model itu eksklusif untuk pemegang kode. Model lain tetap bisa dipakai seperti biasa. Setelah periode selesai, akses khusus ini berakhir otomatis. Harga &amp; saldo tetap seperti biasa.',
+    '',
+    '<i>Cara pakai: disable model di menu Disable Model, lalu bagikan kode akses untuk model itu.</i>',
     '',
     codes.length ? `\u{1F4CB} <b>Kode terbaru</b> (${codes.length})` : '\u{1F4CB} Belum ada kode.',
     ...codes.map((entry) => [
@@ -1930,7 +2435,7 @@ async function adminAccessTargetsView(userId, notice = '') {
     ...(notice ? [notice, ''] : []),
     '\u{1F510} <b>Buat Kode Akses</b> \u{2014} 1/3 Pilih model',
     '',
-    `Tap family untuk memilih modelnya (satu atau lebih, maks. ${ACCESS_MAX_MODELS}). User yang menukarkan kode hanya bisa memakai model yang dipilih di sini.`,
+    `Tap family untuk memilih modelnya (satu atau lebih, maks. ${ACCESS_MAX_MODELS}). User yang menukarkan kode bisa memakai model yang dipilih di sini walaupun model itu di-disable untuk user lain.`,
     '\u{2705} semua model family \u{2022} \u{2611}\u{FE0F} sebagian \u{2022} \u{26AA} belum dipilih',
     '',
     `Dipilih (${draft.models.length}): ${accessModelsText(draft.models, 12)}`,
@@ -2011,9 +2516,13 @@ function adminAccessPeriodView(draft, notice = '') {
 
 // Step 3.
 async function adminAccessConfirmView(draft, notice = '') {
-  // A picked model that is disabled right now stays unusable; say so before the code goes out.
+  // Exclusive = disabled for everyone else right now; the others are open to all users anyway.
   const disabled = await getDisabledModels().catch(() => null);
   const off = disabled ? draft.models.filter((model) => isDisabledIn(disabled, model)) : [];
+  const open = draft.models.filter((model) => !off.includes(model));
+  const status = [];
+  if (off.length) status.push(`\u{1F512} Eksklusif (sedang di-disable untuk user lain, pemegang kode tetap bisa pakai): ${accessModelsText(off, 10)}`);
+  if (open.length) status.push(`\u{2139}\u{FE0F} Sedang terbuka untuk semua user: ${accessModelsText(open, 10)}. Kode baru terasa manfaatnya untuk model ini kalau model itu di-disable di menu <b>Disable Model</b>.`);
   const text = [
     ...(notice ? [notice, ''] : []),
     '\u{1F510} <b>Buat Kode Akses</b> \u{2014} 3/3 Konfirmasi',
@@ -2021,9 +2530,9 @@ async function adminAccessConfirmView(draft, notice = '') {
     `\u{1F916} Model (${draft.models.length}): ${accessModelsText(draft.models, ACCESS_MAX_MODELS)}`,
     `\u{1F552} Periode: <b>${accessPeriodText(draft)}</b>`,
     `\u{23F3} Batas redeem: <b>${accessDeadlineText(draft)}</b>`,
-    ...(off.length ? ['', `\u{26A0}\u{FE0F} Sedang di-disable (tetap tidak bisa dipakai sampai di-enable lagi): ${accessModelsText(off, 10)}`] : []),
+    ...(status.length ? ['', ...status] : []),
     '',
-    'Kode ini <b>sekali pakai</b> (1 user). Selama periode akses, user itu <b>hanya bisa memakai model di atas</b> lewat API: model lain ditolak dan tidak tampil di <code>/v1/models</code>. Setelah periode berakhir, akses model kembali normal otomatis.',
+    'Kode ini <b>sekali pakai</b> (1 user). Selama periode akses, user itu <b>bisa memakai model di atas</b> lewat API walaupun model itu di-disable untuk user lain. Model lain tetap bisa dipakai seperti biasa (tidak dibatasi). Setelah periode berakhir, akses khusus ini selesai otomatis.',
     '<i>Harga, saldo, bonus token, BANSOS dan rate limit tetap berlaku seperti biasa.</i>',
   ].join('\n');
   return { text, reply_markup: { inline_keyboard: [
@@ -2157,7 +2666,7 @@ async function handleAccessCodeAction(query, action) {
     if (result.changed && result.previousStatus === 'available') {
       notice = '\u{1F6AB} Kode dinonaktifkan dan tidak bisa ditukar lagi.';
     } else if (result.changed) {
-      notice = '\u{1F6D1} Akses dihentikan. Akses model user kembali normal.';
+      notice = '\u{1F6D1} Akses khusus dihentikan. Akses model user kembali seperti biasa.';
       const target = result.code.redemption?.telegramId;
       if (target) {
         const account = await getUser(target).catch(() => null);
@@ -2179,7 +2688,7 @@ async function handleAccessCodeAction(query, action) {
     if (!running && entry.status !== 'available') return showAdminView(query, await adminAccessCodeView(entry.code, 'Kode ini sudah tidak aktif.'));
     const code = escapeHtml(entry.code);
     const text = running
-      ? `\u{1F6D1} Hentikan akses dari kode <code>${code}</code> sekarang?\n\n${accessUserLabel(entry.redemption)} tidak lagi dibatasi oleh kode ini; akses modelnya kembali normal (kecuali masih punya kode akses lain yang aktif). Tidak bisa dibatalkan.`
+      ? `\u{1F6D1} Hentikan akses dari kode <code>${code}</code> sekarang?\n\n${accessUserLabel(entry.redemption)} kehilangan akses khusus dari kode ini: model yang di-disable tidak bisa dipakainya lagi (kecuali masih ada di kode akses lain yang aktif). Model lain tidak terpengaruh. Tidak bisa dibatalkan.`
       : `\u{1F6AB} Nonaktifkan kode <code>${code}</code>?\n\nKode tidak bisa ditukar lagi. Tidak bisa dibatalkan.`;
     return showAdminView(query, { text, reply_markup: { inline_keyboard: [[
       { text: running ? '\u{2705} Ya, hentikan' : '\u{2705} Ya, nonaktifkan', callback_data: `admin_mac_offok_${entry.code}` },
@@ -2523,24 +3032,34 @@ function pollUserKeyboard(poll) {
   }]) };
 }
 
-// Sends the poll to every registered user (in their own language) and records how many got it.
-async function broadcastPoll(poll) {
-  let delivered = 0;
-  for (const recipient of await getAllUsers()) {
-    try {
-      await telegram('sendMessage', {
-        chat_id: recipient.telegramId,
-        text: pollUserMessage(poll, userLanguage(recipient)),
-        parse_mode: 'HTML',
-        reply_markup: pollUserKeyboard(poll),
-      });
-      delivered += 1;
-    } catch (error) {
-      console.error('[poll]', recipient.telegramId, error.message);
-    }
-  }
-  await setPollSent(poll.id, delivered);
-  return delivered;
+// Sends the poll to every registered user (in their own language) in the background. The admin's
+// message (`query.message`) shows the progress, then the poll results; how many got it is saved.
+async function broadcastPoll(poll, query) {
+  const recipients = await getAllUsers();
+  const chatId = query.message.chat.id;
+  const messageId = query.message.message_id;
+  const title = `\u{1F4CA} <b>Poll <code>#${poll.id}</code></b>`;
+  return startBroadcast({
+    label: `poll #${poll.id}`,
+    recipients,
+    send: (recipient) => telegram('sendMessage', {
+      chat_id: recipient.telegramId,
+      text: pollUserMessage(poll, userLanguage(recipient)),
+      parse_mode: 'HTML',
+      reply_markup: pollUserKeyboard(poll),
+    }),
+    report: async (stats) => {
+      if (!stats.done) return editStatusMessage(chatId, messageId, broadcastStatusText(title, stats), { inline_keyboard: [] });
+      await setPollSent(poll.id, stats.sent).catch((error) => console.error('[poll] could not save the sent count:', error.message));
+      const latest = (await getPoll(poll.id).catch(() => null)) || poll;
+      const skipped = [
+        stats.unreachable && `${formatTokens(stats.unreachable)} unreachable`,
+        stats.failed && `${formatTokens(stats.failed)} failed`,
+      ].filter(Boolean).join(', ');
+      const notice = `\u{2705} Poll <code>#${poll.id}</code> sent to ${formatTokens(stats.sent)} user(s)${skipped ? ` (${skipped})` : ''} in ${broadcastDuration(stats)}.`;
+      return showAdminView(query, adminPollResultView(latest, notice));
+    },
+  });
 }
 
 // A user pressed an option button: record the vote and redraw their message in place.
@@ -2702,9 +3221,9 @@ async function handlePollAction(query, action) {
     pollDrafts.delete(userId);
     // Replace the preview first, so there is no second "Send" button to press while it goes out.
     await showAdminView(query, { text: `\u{23F3} Sending poll <code>#${poll.id}</code>...`, reply_markup: { inline_keyboard: [] } });
-    const delivered = await broadcastPoll(poll);
-    const latest = (await getPoll(poll.id)) || poll;
-    return showAdminView(query, adminPollResultView(latest, `\u{2705} Poll <code>#${poll.id}</code> sent to ${delivered} user(s).`));
+    // Runs in the background; the same message turns into the poll results when it is done.
+    await broadcastPoll(poll, query);
+    return null;
   }
   return showAdminView(query, await adminPollsView());
 }
@@ -3248,7 +3767,7 @@ async function handleCallbackQuery(query) {
         '',
         'This sets the dashboard statistics back to <b>0</b>:',
         '• Requests, success/error counts, tokens and usage billed (all users)',
-        '• Every user\'s request logs and the admin request logs',
+        '• Every user\'s request logs and usage summaries, and the admin request logs',
         '',
         '<b>Not</b> touched: users, API keys, balances, bonus tokens, referrals, top-up orders, redeem codes, tickets, settings.',
         '',
@@ -3286,7 +3805,33 @@ async function handleCallbackQuery(query) {
   }
   if (action === 'admin_topup') {
     if (String(userId) !== ADMIN_TELEGRAM_ID) return telegram('sendMessage', { chat_id: chatId, text: 'Access denied.' });
-    return telegram('sendMessage', { chat_id: chatId, text: '\u{1F4B3} <b>Top Up User</b>\n\nChoose a user:', parse_mode: 'HTML', reply_markup: await adminUsersKeyboard() });
+    // Opened from the admin panel: a fresh list (first page, no search) in a new message.
+    adminUserListState.set(String(userId), { page: 0, query: '' });
+    const view = await adminUserListView(userId);
+    return telegram('sendMessage', { chat_id: chatId, text: view.text, parse_mode: 'HTML', reply_markup: view.reply_markup });
+  }
+  if (action.startsWith('admin_ul_p_') || action === 'admin_ul_clear' || action === 'admin_ul_back') {
+    const state = userListState(userId);
+    if (action === 'admin_ul_clear') adminUserListState.set(String(userId), { page: 0, query: '' });
+    if (action.startsWith('admin_ul_p_')) {
+      adminUserListState.set(String(userId), { ...state, page: Math.max(0, Number(action.slice('admin_ul_p_'.length)) || 0) });
+    }
+    return showAdminView(query, await adminUserListView(userId));
+  }
+  if (action === 'admin_ul_search') {
+    pendingAdminUserSearch.add(String(userId));
+    return telegram('sendMessage', {
+      chat_id: chatId,
+      text: '\u{1F50D} Kirim <b>ID Telegram</b>, <b>@username</b>, atau sebagian <b>nama</b> user yang dicari.',
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: '\u{1F519} Batal', callback_data: 'admin_ul_back' }]] },
+    });
+  }
+  if (action.startsWith('admin_uu_')) {
+    const [targetId, daysText] = action.slice('admin_uu_'.length).split('_');
+    const days = USAGE_PERIODS.includes(Number(daysText)) ? Number(daysText) : 7;
+    const view = await adminUserUsageView(targetId, days);
+    return showAdminView(query, view || await adminUserListView(userId, '\u{274C} User tidak ditemukan.'));
   }
   if (action === 'admin_logs') {
     if (String(userId) !== ADMIN_TELEGRAM_ID) return telegram('sendMessage', { chat_id: chatId, text: 'Access denied.' });
@@ -3294,7 +3839,7 @@ async function handleCallbackQuery(query) {
     const lines = logs.map((entry) => {
       const model = entry.model ? ` model=${stripModelPrefix(entry.model)}` : '';
       const user = entry.userId ? ` user=${entry.userId}` : ' anonymous';
-      const tokens = ` in=${Number(entry.inputTokens || 0)} out=${Number(entry.outputTokens || 0)} total=${Number(entry.totalTokens || 0)}`;
+      const tokens = ` in=${Number(entry.inputTokens || 0)} out=${Number(entry.outputTokens || 0)} total=${Number(entry.totalTokens || 0)}${entry.estimated ? ' (estimated)' : ''}`;
       const cost = ` cost=Rp${Number(entry.cost || 0).toLocaleString('id-ID', { maximumFractionDigits: 4 })}`;
       const balance = entry.balanceAfter === undefined ? '' : ` balance=Rp${Number(entry.balanceAfter || 0).toLocaleString('id-ID', { maximumFractionDigits: 2 })}`;
       const rate = entry.pricePerMillion ? ` rate=Rp${Number(entry.pricePerMillion).toLocaleString('id-ID')}/1M` : '';
@@ -3308,10 +3853,8 @@ async function handleCallbackQuery(query) {
   }
   if (action.startsWith('admin_topup_user_')) {
     if (String(userId) !== ADMIN_TELEGRAM_ID) return telegram('sendMessage', { chat_id: chatId, text: 'Access denied.' });
-    const targetId = action.slice('admin_topup_user_'.length);
-    const target = await getUser(targetId);
-    if (!target) return telegram('sendMessage', { chat_id: chatId, text: 'User not found.', reply_markup: await adminUsersKeyboard() });
-    return telegram('sendMessage', { chat_id: chatId, text: `\u{1F4B3} Top up <b>${escapeHtml(target.firstName || target.username || target.telegramId)}</b>\n\nCurrent balance: <b>Rp${Number(target.balance || 0).toLocaleString('id-ID')}</b>\n\nChoose amount:`, parse_mode: 'HTML', reply_markup: adminTopupAmounts(targetId) });
+    const view = await adminUserDetailView(action.slice('admin_topup_user_'.length));
+    return showAdminView(query, view || await adminUserListView(userId, '\u{274C} User tidak ditemukan.'));
   }
   if (action.startsWith('admin_topup_amount_')) {
     if (String(userId) !== ADMIN_TELEGRAM_ID) return telegram('sendMessage', { chat_id: chatId, text: 'Access denied.' });
@@ -3319,16 +3862,23 @@ async function handleCallbackQuery(query) {
     const targetId = parts[3];
     const amount = Number(parts[4]);
     const newBalance = await adjustBalance(targetId, amount);
-    if (newBalance === null) return telegram('sendMessage', { chat_id: chatId, text: 'Top up failed: user or amount is invalid.', reply_markup: await adminUsersKeyboard() });
+    if (newBalance === null) return showAdminView(query, await adminUserListView(userId, '\u{274C} Top up gagal: user atau nominal tidak valid.'));
     await telegram('sendMessage', { chat_id: targetId, text: `\u{1F389} <b>Balance added!</b>\n\nTop up: <b>Rp${amount.toLocaleString('id-ID')}</b>\nNew balance: <b>Rp${newBalance.toLocaleString('id-ID')}</b>`, parse_mode: 'HTML' }).catch(() => {});
-    return telegram('sendMessage', { chat_id: chatId, text: `\u{2705} Balance updated.\n\nUser: <code>${escapeHtml(targetId)}</code>\nAdded: <b>Rp${amount.toLocaleString('id-ID')}</b>\nNew balance: <b>Rp${newBalance.toLocaleString('id-ID')}</b>`, parse_mode: 'HTML', reply_markup: await adminKeyboard() });
+    const view = await adminUserDetailView(targetId, `\u{2705} Saldo ditambah <b>${rupiah(amount)}</b>. Saldo baru: <b>${rupiah(newBalance)}</b>.`);
+    return showAdminView(query, view || await adminUserListView(userId));
   }
   if (action.startsWith('admin_topup_custom_')) {
     if (String(userId) !== ADMIN_TELEGRAM_ID) return telegram('sendMessage', { chat_id: chatId, text: 'Access denied.' });
     const targetId = action.slice('admin_topup_custom_'.length);
-    if (!await getUser(targetId)) return telegram('sendMessage', { chat_id: chatId, text: 'User not found.', reply_markup: await adminUsersKeyboard() });
+    const target = USER_ID_PATTERN.test(targetId) ? await getUser(targetId) : null;
+    if (!target) return showAdminView(query, await adminUserListView(userId, '\u{274C} User tidak ditemukan.'));
     pendingAdminTopups.set(String(userId), targetId);
-    return telegram('sendMessage', { chat_id: chatId, text: '\u{270F}\u{FE0F} Send custom balance adjustment.\n\nExamples:\n<code>+50000</code> add Rp50.000\n<code>-10000</code> take Rp10.000', parse_mode: 'HTML' });
+    return telegram('sendMessage', {
+      chat_id: chatId,
+      text: `\u{270F}\u{FE0F} Send custom balance adjustment for <b>${escapeHtml(userDisplayName(target))}</b> (now ${rupiah(target.balance)}).\n\nExamples:\n<code>+50000</code> add Rp50.000\n<code>-10000</code> take Rp10.000`,
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: '\u{1F519} Cancel', callback_data: `admin_topup_user_${targetId}` }]] },
+    });
   }
   if (action === 'admin_announce') {
     if (String(userId) !== ADMIN_TELEGRAM_ID) return telegram('sendMessage', { chat_id: chatId, text: 'Access denied.' });
@@ -3405,12 +3955,24 @@ async function handleCallbackQuery(query) {
         `🕒 ${escapeHtml(entry.at)}`,
         `🤖 Model: <code>${escapeHtml(stripModelPrefix(entry.model) || 'unknown')}</code>`,
         `📥 Input: <b>${formatTokens(input)}</b>  •  📤 Output: <b>${formatTokens(output)}</b>`,
-        `🔢 Total: <b>${formatTokens(total)}</b>  •  💰 Tarif: <b>Rp${formatTokens(entry.pricePerMillion)}/1M</b>`,
+        `🔢 Total: <b>${formatTokens(total)}</b>${entry.estimated ? ' <i>(estimasi)</i>' : ''}  •  💰 Tarif: <b>Rp${formatTokens(entry.pricePerMillion)}/1M</b>`,
         `💳 Biaya: <b>${formatCost(entry.cost)}</b>`,
       ].join('\n');
     });
-    const text = lines.length ? `\u{1F9FE} <b>Recent API Logs</b>\n\n${lines.join('\n\n')}` : '\u{1F9FE} <b>Recent API Logs</b>\n\nNo API usage yet. \u{1F4ED}';
+    const estimatedNote = logs.slice(-10).some((entry) => entry.estimated)
+      ? '\n\n<i>(estimasi) = upstream tidak mengirim jumlah token, jadi token dihitung dari panjang teks.</i>'
+      : '';
+    const text = lines.length ? `\u{1F9FE} <b>Recent API Logs</b>\n\n${lines.join('\n\n')}${estimatedNote}` : '\u{1F9FE} <b>Recent API Logs</b>\n\nNo API usage yet. \u{1F4ED}';
     return telegram('sendMessage', { chat_id: chatId, text, parse_mode: 'HTML', reply_markup: dashboardKeyboard() });
+  }
+  if (action === 'usage') {
+    // From the dashboard button or /usage: a new message, last 7 days.
+    const view = await userUsageView(userId, 7);
+    return telegram('sendMessage', { chat_id: chatId, text: view.text, parse_mode: 'HTML', reply_markup: view.reply_markup });
+  }
+  if (action.startsWith('usage_')) {
+    const days = Number(action.slice('usage_'.length));
+    return showAdminView(query, await userUsageView(userId, USAGE_PERIODS.includes(days) ? days : 7));
   }
 
   return telegram('sendMessage', { chat_id: chatId, text: 'Choose an option from the menu.', parse_mode: 'HTML', reply_markup: menuKeyboard(userId) });
@@ -3512,6 +4074,15 @@ async function handleMessage(message) {
     }
     return;
   }
+  if (isAdmin(userId) && pendingAdminUserSearch.has(userId) && !text.startsWith('/')) {
+    try {
+      await handleUserSearchInput(message.chat.id, userId, text);
+    } catch (error) {
+      pendingAdminUserSearch.delete(userId);
+      await telegram('sendMessage', { chat_id: message.chat.id, text: `\u{274C} Search failed: ${escapeHtml(error.message)}`, parse_mode: 'HTML', reply_markup: adminBackKeyboard() });
+    }
+    return;
+  }
   if (isAdmin(userId) && pendingAdminAccess.has(userId) && !text.startsWith('/')) {
     try {
       await handleAccessCodeInput(message.chat.id, userId, text);
@@ -3561,37 +4132,38 @@ async function handleMessage(message) {
     pendingAdminTopups.delete(userId);
     const normalized = message.text.replace(/[.\sRp]/gi, '');
     const delta = Number(normalized);
+    const backToUser = { inline_keyboard: [[{ text: '\u{1F519} Detail user', callback_data: `admin_topup_user_${targetId}` }]] };
     if (!Number.isFinite(delta) || delta === 0) {
-      await telegram('sendMessage', { chat_id: message.chat.id, text: 'Invalid amount. Use +50000 or -10000.', reply_markup: await adminKeyboard() });
+      await telegram('sendMessage', { chat_id: message.chat.id, text: 'Invalid amount. Use +50000 or -10000.', reply_markup: backToUser });
       return;
     }
     const target = await getUser(targetId);
     const newBalance = await adjustBalance(targetId, delta);
     if (!target || newBalance === null) {
-      await telegram('sendMessage', { chat_id: message.chat.id, text: 'User or amount is invalid.', reply_markup: await adminKeyboard() });
+      await telegram('sendMessage', { chat_id: message.chat.id, text: 'User or amount is invalid.', reply_markup: backToUser });
       return;
     }
     const direction = delta > 0 ? 'added' : 'deducted';
     const absolute = Math.abs(delta);
     await telegram('sendMessage', { chat_id: targetId, text: `\u{1F4B0} Balance ${direction}: <b>Rp${absolute.toLocaleString('id-ID')}</b>\nNew balance: <b>Rp${newBalance.toLocaleString('id-ID')}</b>`, parse_mode: 'HTML' }).catch(() => {});
-    await telegram('sendMessage', { chat_id: message.chat.id, text: `\u{2705} Balance ${direction}.\nUser: <code>${escapeHtml(targetId)}</code>\nAmount: <b>Rp${absolute.toLocaleString('id-ID')}</b>\nNew balance: <b>Rp${newBalance.toLocaleString('id-ID')}</b>`, parse_mode: 'HTML', reply_markup: await adminKeyboard() });
+    await sendAdminUserDetail(message.chat.id, userId, targetId, `\u{2705} Saldo ${delta > 0 ? 'ditambah' : 'dikurangi'} <b>${rupiah(absolute)}</b>. Saldo baru: <b>${rupiah(newBalance)}</b>.`);
     return;
   }
   if (userId === ADMIN_TELEGRAM_ID && pendingAdminActions.has(userId) && !message.text.startsWith('/')) {
     pendingAdminActions.delete(userId);
     const announcement = message.text.trim();
     await setAnnouncement(announcement);
-    let delivered = 0;
-    for (const recipient of await getAllUsers()) {
-      try {
-        // Plain text, exactly as the admin typed it (no header/template).
-        await telegram('sendMessage', { chat_id: recipient.telegramId, text: announcement });
-        delivered += 1;
-      } catch (error) {
-        console.error('[announcement]', recipient.telegramId, error.message);
-      }
-    }
-    await telegram('sendMessage', { chat_id: message.chat.id, text: `\u{2705} Announcement sent to ${delivered} user(s).`, reply_markup: await adminKeyboard() });
+    const recipients = await getAllUsers();
+    const title = '\u{1F4E2} <b>Announcement</b>';
+    const status = await telegram('sendMessage', { chat_id: message.chat.id, text: `${title} \u{2014} \u{23F3} starting\u{2026}`, parse_mode: 'HTML' });
+    // Runs in the background: this handler returns now and the bot keeps answering other users.
+    startBroadcast({
+      label: 'announcement',
+      recipients,
+      // Plain text, exactly as the admin typed it (no header/template).
+      send: (recipient) => telegram('sendMessage', { chat_id: recipient.telegramId, text: announcement }),
+      report: async (stats) => editStatusMessage(message.chat.id, status.message_id, broadcastStatusText(title, stats), stats.done ? await adminKeyboard() : undefined),
+    });
     return;
   }
   if (await routeTicketMessage(message, userId, user)) return;
@@ -3654,6 +4226,7 @@ const BOT_COMMANDS = [
   { command: 'topup', id: 'Isi saldo', en: 'Top up your balance' },
   { command: 'model', id: 'Daftar model & harga', en: 'Model list & prices' },
   { command: 'logs', id: 'Riwayat pemakaian API terbaru', en: 'Recent API usage' },
+  { command: 'usage', id: 'Ringkasan pemakaian per model', en: 'Usage summary per model' },
   { command: 'redeem', id: 'Tukar kode redeem', en: 'Redeem a code' },
   { command: 'referral', id: 'Undang teman, dapat bonus token', en: 'Invite friends, earn bonus tokens' },
   { command: 'ticket', id: 'Hubungi admin lewat ticket', en: 'Contact support with a ticket' },
@@ -3666,7 +4239,7 @@ const COMMAND_LANGUAGES = [
   { languageCode: '', text: 'en' },
 ];
 // Commands that do exactly what a main-menu button does: command -> that button's callback_data.
-const COMMAND_ACTIONS = new Map([['dashboard', 'dashboard'], ['topup', 'top_up'], ['logs', 'logs'], ['referral', 'referral']]);
+const COMMAND_ACTIONS = new Map([['dashboard', 'dashboard'], ['topup', 'top_up'], ['logs', 'logs'], ['usage', 'usage'], ['referral', 'referral']]);
 
 // "/topup" or "/topup@MyBot" -> "topup". Null for other text, and for a command meant for a
 // different bot (in a group).
