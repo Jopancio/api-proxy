@@ -7,7 +7,6 @@ node_modules/
 !.env.example
 
 # Runtime state (user accounts, balances, model cache, settings, and locks)
-data/
 
 # Generated logs
 *.log

@@ -1,0 +1,32 @@
+{
+  "allModelsFree": true,
+  "announcement": "Mohon maaf atas ketidaknyamanan yang terjadi akibat server yang beberapa kali mengalami down. Hal ini disebabkan oleh provider hosting yang saat ini kami gunakan mengalami overload, sehingga berdampak pada kestabilan dan aksesibilitas server.\n\nUntuk meningkatkan stabilitas serta memberikan pelayanan yang lebih baik, kami berencana untuk memindahkan hosting ke server yang kami kelola sendiri.\n\nKami mohon pengertiannya selama proses perbaikan dan pemindahan berlangsung. Terima kasih atas kesabaran dan kepercayaannya. 🙏",
+  "paymentsEnabled": false,
+  "disabledFamilies": [],
+  "rateLimits": {
+    "models": {
+      "gpt-6-sol": 15,
+      "gpt-6-luna": 35
+    },
+    "families": {}
+  },
+  "disabledModels": [
+    "cbcn/glm-5.3",
+    "cbcn/glm-5.1",
+    "cbcn/glm-5.2",
+    "cbcn/glm-5v-turbo",
+    "glm-5.0-turbo",
+    "glm-5.3-flashx",
+    "glm-5.3"
+  ],
+  "announcementAt": "2026-10-06T01:06:47.788Z",
+  "referral": {
+    "enabled": false,
+    "rewardTokens": 1000000,
+    "maxRewardsPerUser": 0
+  },
+  "promptLogEnabled": false,
+  "moderation": {
+    "enabled": false
+  }
+}
