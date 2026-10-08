@@ -231,15 +231,23 @@ function createOrder(telegramId, order) {
   });
 }
 
+// Legacy Rupiah top-up. `amount` is what the payment provider reports as paid; when it is
+// reported and lower than the order, nothing is credited (the order stays PENDING).
 function settleOrder(orderId, amount) {
   return mutateDatabase((database) => {
     for (const user of Object.values(database.users)) {
       const order = user.orders.find((entry) => entry.orderId === orderId);
       if (!order) continue;
       if (order.status === 'SETTLED') return { settled: false, userId: user.telegramId, balance: user.balance };
+      const reported = amount === undefined || amount === null || amount === '' ? null : Number(amount);
+      if (reported !== null && !(Number.isFinite(reported) && reported >= Number(order.amount))) {
+        order.lastRejectedAt = new Date().toISOString();
+        order.lastRejectedAmount = Number.isFinite(reported) ? reported : String(amount).slice(0, 40);
+        return { settled: false, reason: 'amount_mismatch', userId: user.telegramId, balance: user.balance };
+      }
       order.status = 'SETTLED';
       order.settledAt = new Date().toISOString();
-      order.paidAmount = Number(amount || order.amount);
+      order.paidAmount = Number(reported ?? order.amount);
       user.balance += Number(order.amount);
       return { settled: true, userId: user.telegramId, balance: user.balance };
     }
@@ -335,6 +343,16 @@ function recordUsage(apiKey, usage = {}) {
     bonusTokensUsed,
     // The upstream sent no token counts, so server.js estimated them from the text.
     ...(usage.estimated ? { estimated: true } : {}),
+    // Token credits (server.js): which balance paid and what the credit ledger charged.
+    ...(usage.funding ? { funding: String(usage.funding) } : {}),
+    ...(usage.funding === 'credits' ? {
+      credits: Math.max(0, Math.floor(Number(usage.credits) || 0)),
+      multiplier: String(usage.multiplier || ''),
+      rateModel: String(usage.rateModel || ''),
+      cachedInputTokens: Math.max(0, Math.floor(Number(usage.cachedInputTokens) || 0)),
+      ...(usage.partial ? { partial: true } : {}),
+      ...(usage.shortfall ? { shortfall: Math.floor(Number(usage.shortfall) || 0) } : {}),
+    } : {}),
   });
   owner.logs = owner.logs.slice(-50);
     return { telegramId: owner.telegramId, cost, bonusTokensUsed, balance: owner.balance, bonusTokens: owner.bonusTokens, inputTokens, outputTokens, statusCode };
@@ -347,6 +365,7 @@ function recordUsage(apiKey, usage = {}) {
       inputTokens: recorded.inputTokens,
       outputTokens: recorded.outputTokens,
       cost: recorded.cost,
+      credits: usage.funding === 'credits' ? usage.credits : 0,
       error: recorded.statusCode >= 400,
     });
   } catch (error) {
@@ -527,7 +546,9 @@ const DEFAULT_ACCESS_REDEEM_WINDOW_MS = 30 * DAY_MS;
 const MAX_ACCESS_MODELS = 50;
 const MAX_ACCESS_GRANT_HISTORY = 20; // finished grants kept per user (open ones are never pruned)
 const ACCESS_MODEL_NAME = /^[a-z0-9][a-z0-9._:+-]{0,99}$/;
-const modelCachePath = path.join(__dirname, 'data', 'models.json');
+const modelCachePath = process.env.MODEL_CACHE_PATH
+  ? path.resolve(__dirname, process.env.MODEL_CACHE_PATH)
+  : path.join(__dirname, 'data', 'models.json');
 
 // Display name, lowercase: same key as admin-settings.js uses for disabled models.
 function accessModelKey(model) {
@@ -1586,14 +1607,17 @@ function recordDailyUsage(telegramId, entry = {}, now = Date.now()) {
   return mutateLockedJson(usageDailyPath, readUsageDaily, (data) => {
     const days = isPlainObject(data.users[id]) ? data.users[id] : {};
     const models = isPlainObject(days[day]) ? days[day] : {};
-    const counts = Array.isArray(models[model]) ? models[model].map((value) => Number(value) || 0) : [0, 0, 0, 0, 0];
+    const counts = Array.isArray(models[model]) ? models[model].map((value) => Number(value) || 0) : [0, 0, 0, 0, 0, 0];
+    while (counts.length < 6) counts.push(0); // rows written before token credits had 5 columns
     counts[0] += 1;
     counts[1] += entry.error ? 1 : 0;
     counts[2] += Math.max(0, Number(entry.inputTokens) || 0);
     counts[3] += Math.max(0, Number(entry.outputTokens) || 0);
     // Rp, kept to 6 decimals so the file does not fill up with float noise.
     counts[4] = Math.round((counts[4] + Math.max(0, Number(entry.cost) || 0)) * 1e6) / 1e6;
-    models[model] = counts.slice(0, 5);
+    // Token credits charged (whole credits).
+    counts[5] += Math.max(0, Math.floor(Number(entry.credits) || 0));
+    models[model] = counts.slice(0, 6);
     days[day] = models;
     pruneUsageDays(days, oldest);
     data.users[id] = days;
@@ -1614,16 +1638,17 @@ function recordDailyUsage(telegramId, entry = {}, now = Date.now()) {
 }
 
 function emptyUsageTotals(extra = {}) {
-  return { ...extra, requests: 0, errors: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, cost: 0 };
+  return { ...extra, requests: 0, errors: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, cost: 0, credits: 0 };
 }
 
-function addUsageTotals(target, [requests, errors, inputTokens, outputTokens, cost]) {
+function addUsageTotals(target, [requests, errors, inputTokens, outputTokens, cost, credits = 0]) {
   target.requests += requests;
   target.errors += errors;
   target.inputTokens += inputTokens;
   target.outputTokens += outputTokens;
   target.totalTokens += inputTokens + outputTokens;
   target.cost += cost;
+  target.credits += credits;
 }
 
 // Summary of the last `periodDays` days (today included, WIB) from one user's day map. Pure.
@@ -1641,7 +1666,7 @@ function usageSummaryFrom(days, periodDays = 7, now = Date.now()) {
     const models = Object.prototype.hasOwnProperty.call(source, date) && isPlainObject(source[date]) ? source[date] : {};
     for (const [model, raw] of Object.entries(models)) {
       if (!Array.isArray(raw)) continue;
-      const counts = [0, 1, 2, 3, 4].map((index) => Math.max(0, Number(raw[index]) || 0));
+      const counts = [0, 1, 2, 3, 4, 5].map((index) => Math.max(0, Number(raw[index]) || 0));
       if (!byModel.has(model)) byModel.set(model, emptyUsageTotals({ model }));
       addUsageTotals(byModel.get(model), counts);
       addUsageTotals(day, counts);
@@ -1735,4 +1760,6 @@ module.exports = { ensureUser, setUserLanguage, SUPPORTED_LANGUAGES, createApiKe
   createTicket, addTicketMessage, linkAdminMessage, findTicketByAdminMessage, getTicket, getOpenTicketForUser, listTickets, countOpenTickets, closeTicket,
   createPoll, votePoll, getPoll, listPolls, closePoll, setPollSent,
   recordPrompt, listPromptUsers, getUserPrompts, clearPrompts, clearAllPrompts, promptLogPath,
-  recordModerationBlock, addModerationStats, listModerationBlocks, getModerationBlock, clearModerationBlocks, moderationLogPath };
+  recordModerationBlock, addModerationStats, listModerationBlocks, getModerationBlock, clearModerationBlocks, moderationLogPath,
+  // Shared with credit-store.js / credit-config.js (same lock and busy-error semantics).
+  withFileLock, DatabaseBusyError, isDatabaseBusyError, modelCachePath };

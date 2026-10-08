@@ -19,9 +19,13 @@ const {
   listBansos, createBansos, stopBansos,
   getModerationSettings, setModerationSettings, listModerationBlocks, getModerationBlock, clearModerationBlocks,
   getReferralInfo, startWithReferral, getReferralSettings, setReferralSettings,
+  getCreditOverview, getCreditOrder, createCreditOrder, markCreditOrderFailed, settlePayment, adminConfirmCreditOrder,
+  adjustCredits, refundCredits, getCreditStats, listCreditOrders, getCreditCatalog, getCreditAdmin, updateCreditConfig,
   saveModelCache, dataMode,
 } = require('./data-client');
 const { DEFAULT_MODEL_PRICE, PINNED_MODELS, getModelFamily, getModelPrice, stripModelPrefix, tokenAllowance } = require('./pricing');
+// Pure helpers only (parsing admin commands, credit math for estimates); no data access.
+const creditRules = require('./credit-rules');
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const UPSTREAM_BASE_URL = process.env.UPSTREAM_BASE_URL || 'https://sg1-9682fffda636.shinsengumi.my.id/v1';
@@ -65,6 +69,9 @@ const adminUserListState = new Map();
 // draft ({ question, options }) waiting for "Send". The draft survives button presses.
 const pendingAdminPoll = new Set();
 const pollDrafts = new Map();
+// Admin typing credit commands (Admin Panel -> Kredit & Paket): { mode: 'console' } or
+// { mode: 'user', targetId } for one user's credit adjustment.
+const pendingAdminCredit = new Map();
 const MAX_REFERRAL_REWARD = 1_000_000_000;
 const MAX_REFERRAL_CAP = 100_000;
 // Set from getMe at startup; used to build t.me/<bot>?start=<code> referral links.
@@ -93,6 +100,7 @@ function clearPendingInput(userId) {
   pendingAdminAccess.delete(id);
   pendingAdminUserSearch.delete(id);
   pendingAdminPoll.delete(id);
+  pendingAdminCredit.delete(id);
 }
 
 // Accepts "25000", "25.000", "Rp25.000", "25,000".
@@ -207,9 +215,10 @@ function card(title, lines) {
 
 function menuKeyboard(userId = '') {
   const rows = [
-    [{ text: '\u{1F4CA} API Dashboard', callback_data: 'dashboard' }, { text: '\u{1F4B3} Top up', callback_data: 'top_up' }],
-    [{ text: '\u{1F9FE} Logs', callback_data: 'logs' }, { text: '\u{1F39F}\u{FE0F} Redeem Code', callback_data: 'redeem' }],
-    [{ text: '\u{1F3AB} Create a Ticket', callback_data: 'ticket' }, { text: '\u{1F91D} Referral', callback_data: 'referral' }],
+    [{ text: '\u{1F48E} Kredit Token', callback_data: 'credits' }, { text: '\u{1F4B3} Top up', callback_data: 'top_up' }],
+    [{ text: '\u{1F4CA} API Dashboard', callback_data: 'dashboard' }, { text: '\u{1F9FE} Logs', callback_data: 'logs' }],
+    [{ text: '\u{1F39F}\u{FE0F} Redeem Code', callback_data: 'redeem' }, { text: '\u{1F91D} Referral', callback_data: 'referral' }],
+    [{ text: '\u{1F3AB} Create a Ticket', callback_data: 'ticket' }],
   ];
   if (String(userId) === ADMIN_TELEGRAM_ID) rows.push([{ text: '\u{1F6E0}\u{FE0F} Admin Panel', callback_data: 'admin_panel' }]);
   return { inline_keyboard: rows };
@@ -217,8 +226,9 @@ function menuKeyboard(userId = '') {
 
 function dashboardKeyboard() {
   return { inline_keyboard: [
+    [{ text: '\u{1F48E} Kredit Token', callback_data: 'credits' }, { text: '\u{1F4CB} Model & Multiplier', callback_data: 'cr_models' }],
     [{ text: '\u{1F9FE} Logs', callback_data: 'logs' }, { text: '\u{1F4C8} Usage Summary', callback_data: 'usage' }],
-    [{ text: '\u{1F4B0} Model Price', callback_data: 'model_price' }, { text: '\u{1F4B3} Top Up Saldo', callback_data: 'top_up' }],
+    [{ text: '\u{1F4B0} Model Price', callback_data: 'model_price' }, { text: '\u{1F4B3} Top Up', callback_data: 'top_up' }],
     [{ text: '\u{1F511} Create new API key', callback_data: 'create_key' }, { text: '\u{1F5D1}\u{FE0F} Revoke API Key', callback_data: 'revoke' }],
     [{ text: '\u{1F3AB} Create a Ticket', callback_data: 'ticket' }, { text: '\u{1F519} Back to menu', callback_data: 'menu' }],
   ] };
@@ -226,6 +236,7 @@ function dashboardKeyboard() {
 
 function modelKeyboard() {
   return { inline_keyboard: [
+    [{ text: '\u{1F4CB} Model & Multiplier (kredit)', callback_data: 'cr_models' }],
     [{ text: '\u{1F504} Resync Models', callback_data: 'model_resync' }],
     [{ text: '\u{1F519} Back to dashboard', callback_data: 'dashboard' }],
   ] };
@@ -301,7 +312,7 @@ async function adminKeyboard() {
     }],
     // Balance & codes
     [{ text: '\u{1F39F}\u{FE0F} Redeem Codes', callback_data: 'admin_redeem' }, { text: '\u{1F464} Users & Top Up', callback_data: 'admin_topup' }],
-    [{ text: '\u{1F510} Kode Akses Model', callback_data: 'admin_mac' }],
+    [{ text: '\u{1F510} Kode Akses Model', callback_data: 'admin_mac' }, { text: '\u{1F48E} Kredit & Paket', callback_data: 'admin_cr' }],
     // Settings & broadcast
     [
       { text: await isAllModelsFree() ? '\u{1F534} Disable Free Mode' : '\u{1F7E2} Free Mode', callback_data: 'admin_free_toggle' },
@@ -495,7 +506,10 @@ function userLogLine(entry) {
   // "2026-10-04 15:48:09" -> "04/10 15:48" (WIB).
   const time = wibLogTime(entry.at);
   const when = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(time) ? `${time.slice(8, 10)}/${time.slice(5, 7)} ${time.slice(11, 16)}` : time;
-  return `${entry.status >= 400 ? '\u{274C}' : '\u{2705}'} ${escapeHtml(when)} <code>${model}</code> \u{2022} ${formatTokens(total)} tok${entry.estimated ? ' (est.)' : ''} \u{2022} ${formatCost(entry.cost)}`;
+  const charge = entry.funding === 'credits'
+    ? `\u{1F48E} ${formatTokens(entry.credits)} kr (${multiplierText(entry.multiplier || '?')})`
+    : entry.funding === 'unlimited' ? '\u{267E}\u{FE0F} unlimited' : formatCost(entry.cost);
+  return `${entry.status >= 400 ? '\u{274C}' : '\u{2705}'} ${escapeHtml(when)} <code>${model}</code> \u{2022} ${formatTokens(total)} tok${entry.estimated ? ' (est.)' : ''} \u{2022} ${charge}`;
 }
 
 function adminUserKeyboard(user, { ticket, access } = {}) {
@@ -505,6 +519,7 @@ function adminUserKeyboard(user, { ticket, access } = {}) {
     [preset(TOPUP_PRESETS[0]), preset(TOPUP_PRESETS[1])],
     [preset(TOPUP_PRESETS[2]), preset(TOPUP_PRESETS[3])],
     [{ text: '\u{270F}\u{FE0F} Tambah / kurangi (custom)', callback_data: `admin_topup_custom_${id}` }],
+    [{ text: '\u{1F48E} Kredit token: tambah / kurangi / refund', callback_data: `admin_cr_user_${id}` }],
     [{ text: '\u{1F4C8} Pemakaian 30 hari', callback_data: `admin_uu_${id}_30` }, { text: '\u{1F4AC} Prompts', callback_data: `admin_prompts_u_${id}` }],
   ];
   if (ticket) rows.push([{ text: `\u{1F3AB} Ticket #${ticket.id} (terbuka)`, callback_data: `admin_ticket_view_${ticket.id}` }]);
@@ -521,10 +536,11 @@ async function adminUserDetailView(targetId, notice = '') {
   const user = USER_ID_PATTERN.test(String(targetId)) ? await getUser(targetId) : null;
   if (!user) return null;
   const id = String(user.telegramId);
-  const [access, week, ticket] = await Promise.all([
+  const [access, week, ticket, credit] = await Promise.all([
     getModelAccess(id).catch(() => null),
     getUsageSummary(id, 7).catch(() => null),
     getOpenTicketForUser(id).catch(() => null),
+    getCreditOverview(id).catch(() => null),
   ]);
   const stats = user.stats || {};
   const requests = Number(stats.requests || 0);
@@ -552,6 +568,11 @@ async function adminUserDetailView(targetId, notice = '') {
       `Total terpakai: <b>${formatCost(stats.spent)}</b>`,
       `Top up lunas: <b>${rupiah(settled.reduce((sum, order) => sum + Number(order.amount || 0), 0))}</b> (${formatTokens(settled.length)}x)${pending ? ` \u{2022} ${formatTokens(pending)} pending` : ''}`,
     ]),
+    ...(credit ? [card('\u{1F48E} <b>Kredit token</b>', [
+      `Tersedia: <b>${bigNumber(credit.account.available)}</b> \u{2022} direservasi: <b>${bigNumber(credit.account.reserved)}</b>`,
+      `Dibeli: ${bigNumber(credit.account.purchased)} \u{2022} terpakai: ${bigNumber(credit.account.used)} \u{2022} refund: ${bigNumber(credit.account.refunded)} \u{2022} admin: ${formatTokens(credit.account.adjusted)}`,
+      ...[...credit.passes.active, ...credit.passes.scheduled].slice(0, 2).map((pass) => `\u{267E}\u{FE0F} ${escapeHtml(pass.name || 'Unlimited')} ${pass.status === 'active' ? 's/d' : 'mulai'} ${escapeHtml(wibTime(pass.status === 'active' ? pass.endsAt : pass.startsAt))}`),
+    ])] : []),
     card('\u{1F4C8} <b>Pemakaian</b>', [
       `Total: <b>${formatTokens(requests)}</b> req (\u{26A0}\u{FE0F} ${formatTokens(errors)} error) \u{2022} <b>${bigNumber(stats.totalTokens)}</b> token`,
       week && `7 hari: <b>${formatTokens(week.totals.requests)}</b> req \u{2022} <b>${bigNumber(week.totals.totalTokens)}</b> token \u{2022} <b>${formatCost(week.totals.cost)}</b>`,
@@ -679,13 +700,14 @@ function usageSummaryView(summary, { lang = DEFAULT_LANGUAGE, days = 7, periodDa
       `\u{1F4E5} ${bigNumber(totals.inputTokens)} \u{2022} \u{1F4E4} ${bigNumber(totals.outputTokens)}`,
       `\u{1F522} <b>${bigNumber(totals.totalTokens)}</b> ${t.tokens}`,
       `\u{1F4B8} ${t.cost}: <b>${formatCost(totals.cost)}</b>`,
+      totals.credits > 0 && `\u{1F48E} ${lang === 'en' ? 'Credits' : 'Kredit'}: <b>${bigNumber(totals.credits)}</b>`,
     ]));
     const byTokens = totals.totalTokens > 0;
     const modelLines = summary.models.slice(0, USAGE_MODELS_SHOWN).map((entry) => {
       const share = byTokens ? (entry.totalTokens / totals.totalTokens) * 100 : (entry.requests / totals.requests) * 100;
       return [
         `<code>${escapeHtml(entry.model)}</code> ${progressBar(share, 8)} <b>${share.toFixed(share < 10 ? 1 : 0)}%</b>`,
-        `   ${formatTokens(entry.requests)} req \u{2022} ${bigNumber(entry.totalTokens)} tok \u{2022} ${formatCost(entry.cost)}`,
+        `   ${formatTokens(entry.requests)} req \u{2022} ${bigNumber(entry.totalTokens)} tok \u{2022} ${formatCost(entry.cost)}${entry.credits ? ` \u{2022} \u{1F48E} ${shortNumber(entry.credits)}` : ''}`,
       ].join('\n');
     });
     if (summary.models.length > USAGE_MODELS_SHOWN) modelLines.push(`<i>${t.more(summary.models.length - USAGE_MODELS_SHOWN)}</i>`);
@@ -909,6 +931,8 @@ async function adminPanelMessage() {
   // Null when the API server has no BANSOS support yet (outdated files there).
   const bansos = await listBansos().catch(() => null);
   const bansosCount = (status) => bansos.filter((entry) => entry.status === status).length;
+  // Null when the API server has no token credits yet.
+  const credit = await getCreditStats().catch(() => null);
   return [
     '\u{1F6E0}\u{FE0F} <b>ADMIN DASHBOARD</b>',
     `<i>${escapeHtml(STORE_NAME)} \u{2022} control center</i>`,
@@ -938,6 +962,11 @@ async function adminPanelMessage() {
       `Redeemed codes: <b>${rupiah(s.redeemedAmount)}</b>  (${formatTokens(s.redemptions)}x)`,
       `Users' total balance: <b>${rupiah(s.totalBalance)}</b>`,
     ]),
+    ...(credit ? [card('\u{1F48E} <b>Token credits</b>', [
+      `Sold: <b>${bigNumber(credit.purchased)}</b> \u{2022} used: <b>${bigNumber(credit.used)}</b>`,
+      `Outstanding: <b>${bigNumber(credit.totalBalance)}</b> \u{2022} reserved: ${bigNumber(credit.totalReserved)}`,
+      `Revenue: <b>${rupiah(credit.revenueIdr)}</b> (${formatTokens(credit.settledOrders)} paid \u{2022} ${formatTokens(credit.pendingOrders)} pending) \u{2022} unlimited active: ${formatTokens(credit.activePasses)}`,
+    ])] : []),
     card('\u{1F39F}\u{FE0F} <b>Redeem Codes</b>', [
       `Created: <b>${formatTokens(s.redeemCodes)}</b>  \u{2022}  Still active: <b>${formatTokens(s.activeRedeemCodes)}</b>`,
       // Missing on an API server without model access codes yet.
@@ -1028,6 +1057,8 @@ async function handleLanguageChoice(query, lang) {
 
 async function welcomeMessage(firstName, telegramId) {
   const account = telegramId ? await getUser(telegramId) : null;
+  // An API server without token credits yet simply shows none.
+  const creditAccount = telegramId ? (await getCreditOverview(telegramId).catch(() => null))?.account : null;
   const balance = Number(account?.balance || 0);
   const bonusTokens = Number(account?.bonusTokens || 0);
   const activeKeys = (account?.apiKeys || []).filter((entry) => entry.active !== false).length;
@@ -1041,7 +1072,8 @@ async function welcomeMessage(firstName, telegramId) {
       '',
       card('\u{1F464} <b>Your account</b>', [
         ...(telegramId ? [`\u{1F194} ID: <code>${escapeHtml(telegramId)}</code>`] : []),
-        `\u{1F4B0} Balance: <b>${rupiah(balance)}</b>`,
+        creditAccount ? `\u{1F48E} Token credits: <b>${bigNumber(creditAccount.available)}</b>` : '',
+        (balance > 0 || !creditAccount) ? `\u{1F4B0} Balance: <b>${rupiah(balance)}</b>${creditAccount ? ' <i>(old Rupiah balance)</i>' : ''}` : '',
         bonusTokens > 0 ? `\u{1F381} Bonus tokens: <b>${bigNumber(bonusTokens)}</b>` : '',
         `\u{1F511} Active API keys: <b>${formatTokens(activeKeys)}</b>`,
       ]),
@@ -1058,7 +1090,8 @@ async function welcomeMessage(firstName, telegramId) {
     '',
     card('\u{1F464} <b>Akun kamu</b>', [
       ...(telegramId ? [`\u{1F194} ID: <code>${escapeHtml(telegramId)}</code>`] : []),
-      `\u{1F4B0} Saldo: <b>${rupiah(balance)}</b>`,
+      creditAccount ? `\u{1F48E} Kredit token: <b>${bigNumber(creditAccount.available)}</b>` : '',
+      (balance > 0 || !creditAccount) ? `\u{1F4B0} Saldo: <b>${rupiah(balance)}</b>${creditAccount ? ' <i>(saldo Rupiah lama)</i>' : ''}` : '',
       bonusTokens > 0 ? `\u{1F381} Bonus token: <b>${bigNumber(bonusTokens)}</b>` : '',
       `\u{1F511} API key aktif: <b>${formatTokens(activeKeys)}</b>`,
     ]),
@@ -1081,6 +1114,8 @@ async function statsMessage(telegramId) {
     : ['\u{1F511} API key: <i>belum ada \u{2014} tekan "Create new API key"</i>'];
   // An API server without model access codes yet simply has none.
   const accessCard = modelAccessCard(await getModelAccess(telegramId).catch(() => null), userLanguage(user));
+  const credit = await getCreditOverview(telegramId).catch(() => null);
+  const activePass = credit?.passes?.active?.[0];
   return [
     '\u{1F4CA} <b>API DASHBOARD</b>',
     DIVIDER,
@@ -1088,8 +1123,13 @@ async function statsMessage(telegramId) {
       `\u{1F4E1} Base URL: <code>${escapeHtml(PUBLIC_BASE_URL)}</code>`,
       ...keyLines,
     ]),
+    ...(credit ? [card('\u{1F48E} <b>Kredit token</b>', [
+      `Tersedia: <b>${bigNumber(credit.account.available)}</b> kredit`,
+      credit.account.reserved > 0 && `Sedang direservasi: <b>${bigNumber(credit.account.reserved)}</b> kredit`,
+      activePass && `\u{267E}\u{FE0F} ${escapeHtml(activePass.name || 'Unlimited')} aktif s/d <b>${escapeHtml(wibTime(activePass.endsAt))}</b>`,
+    ])] : []),
     card('\u{1F4B3} <b>Balance</b>', [
-      `\u{1F4B0} Saldo: <b>${rupiah(user.balance)}</b>`,
+      `\u{1F4B0} Saldo: <b>${rupiah(user.balance)}</b>${credit ? ' <i>(saldo Rupiah lama, terpisah dari kredit)</i>' : ''}`,
       `\u{1F381} Bonus tokens: <b>${bigNumber(bonusTokens)}</b>${bonusTokens > 0 ? ' <i>(dipakai duluan)</i>' : ''}`,
     ]),
     ...(accessCard ? [accessCard] : []),
@@ -1170,7 +1210,7 @@ async function modelPriceMessage(telegramId) {
     });
     return `<b>${family} Family</b>\n${lines.join('\n')}`;
   }).filter(Boolean);
-  return `${notice}\u{1F4B0} <b>Model Price</b>\n\n${sections.length ? sections.join('\n\n') : 'No supported models returned by upstream.'}`;
+  return `${notice}\u{1F4B0} <b>Model Price</b>\n<i>Harga per 1M token untuk saldo Rupiah lama. Kredit token memakai multiplier: lihat \u{1F4CB} Model &amp; Multiplier.</i>\n\n${sections.length ? sections.join('\n\n') : 'No supported models returned by upstream.'}`;
 }
 
 function revokeKeyboard(user) {
@@ -1180,6 +1220,45 @@ function revokeKeyboard(user) {
   return { inline_keyboard: rows };
 }
 
+// Asks Cashi for a QR payment. Throws when Cashi refuses (then no payment can exist).
+async function cashiCreatePayment(orderId, amount) {
+  const response = await fetch(CASHI_API_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-api-key': CASHI_API_KEY },
+    body: JSON.stringify({ amount, order_id: orderId }),
+  });
+  const result = await response.json();
+  if (!response.ok || !result.success) throw new Error(result.message || `Cashi returned ${response.status}`);
+  return result;
+}
+
+async function sendCashiQr(chatId, result, caption, orderId) {
+  if (!result.qrUrl) throw new Error('Cashi did not return qrUrl for this payment');
+  const qrUrl = String(result.qrUrl).trim();
+  if (/^data:image\//i.test(qrUrl)) {
+    const separator = qrUrl.indexOf(',');
+    if (separator < 0) throw new Error('Invalid QR image returned by Cashi');
+    const metadata = qrUrl.slice(5, separator);
+    const imageData = qrUrl.slice(separator + 1).trim();
+    const mimeType = metadata.split(';')[0] || 'image/png';
+    const isBase64 = /;base64/i.test(metadata);
+    if (!imageData) throw new Error('Empty QR image returned by Cashi');
+    const imageBuffer = isBase64
+      ? Buffer.from(imageData.replace(/\s/g, ''), 'base64')
+      : Buffer.from(decodeURIComponent(imageData), 'utf8');
+    const form = new FormData();
+    form.append('chat_id', String(chatId));
+    form.append('caption', caption);
+    form.append('parse_mode', 'HTML');
+    form.append('photo', new Blob([imageBuffer], { type: mimeType }), 'cashi-qr.png');
+    await telegramMultipart('sendPhoto', form);
+  } else {
+    await telegram('sendPhoto', { chat_id: chatId, photo: qrUrl, caption, parse_mode: 'HTML' });
+  }
+  await telegram('sendMessage', { chat_id: chatId, text: 'After payment, press Refresh status to check your payment. \u{1F4CA}\nSetelah membayar, tekan Refresh status.', reply_markup: { inline_keyboard: [[{ text: '\u{1F504} Refresh status', callback_data: `status_${orderId}` }], [{ text: '\u{1F519} Back to menu', callback_data: 'menu' }]] } });
+}
+
+// Old Rupiah balance top-up (unchanged behaviour).
 async function createCashiOrder(chatId, telegramId, amount) {
   if (!CASHI_API_KEY) {
     await telegram('sendMessage', { chat_id: chatId, text: '\u{26A0}\u{FE0F} Cashi payments are not configured yet. Add CASHI_API_KEY to .env.' });
@@ -1187,59 +1266,110 @@ async function createCashiOrder(chatId, telegramId, amount) {
   }
   const orderId = `TG-${telegramId}-${Date.now()}-${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
   try {
-    const response = await fetch(CASHI_API_URL, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-api-key': CASHI_API_KEY },
-      body: JSON.stringify({ amount, order_id: orderId }),
-    });
-    const result = await response.json();
-    if (!response.ok || !result.success) throw new Error(result.message || `Cashi returned ${response.status}`);
+    const result = await cashiCreatePayment(orderId, amount);
     await createOrder(telegramId, { orderId, amount, checkoutUrl: result.checkout_url, provider: result.provider || 'CASHI' });
     const caption = `\u{2705} <b>Payment QR ready</b>\n\nAmount: <b>Rp${amount.toLocaleString('id-ID')}</b>\nOrder: <code>${orderId}</code>\n\nScan this QR to pay. Your balance will update automatically after Cashi confirms payment.`;
-    if (!result.qrUrl) throw new Error('Cashi did not return qrUrl for this payment');
-    const qrUrl = String(result.qrUrl).trim();
-    if (/^data:image\//i.test(qrUrl)) {
-      const separator = qrUrl.indexOf(',');
-      if (separator < 0) throw new Error('Invalid QR image returned by Cashi');
-      const metadata = qrUrl.slice(5, separator);
-      const imageData = qrUrl.slice(separator + 1).trim();
-      const mimeType = metadata.split(';')[0] || 'image/png';
-      const isBase64 = /;base64/i.test(metadata);
-      if (!imageData) throw new Error('Empty QR image returned by Cashi');
-      const imageBuffer = isBase64
-        ? Buffer.from(imageData.replace(/\s/g, ''), 'base64')
-        : Buffer.from(decodeURIComponent(imageData), 'utf8');
-      const form = new FormData();
-      form.append('chat_id', String(chatId));
-      form.append('caption', caption);
-      form.append('parse_mode', 'HTML');
-      form.append('photo', new Blob([imageBuffer], { type: mimeType }), 'cashi-qr.png');
-      await telegramMultipart('sendPhoto', form);
-    } else {
-      await telegram('sendPhoto', { chat_id: chatId, photo: qrUrl, caption, parse_mode: 'HTML' });
-    }
-    await telegram('sendMessage', { chat_id: chatId, text: 'After payment, press Refresh status to check your payment. \u{1F4CA}', reply_markup: { inline_keyboard: [[{ text: '\u{1F504} Refresh status', callback_data: `status_${orderId}` }], [{ text: '\u{1F519} Back to menu', callback_data: 'menu' }]] } });
+    await sendCashiQr(chatId, result, caption, orderId);
   } catch (error) {
     console.error('[cashi]', error.message);
     await telegram('sendMessage', { chat_id: chatId, text: `\u{274C} Could not create the payment: ${escapeHtml(error.message)}`, parse_mode: 'HTML', reply_markup: menuKeyboard() });
   }
 }
 
+// Token credit package or unlimited package. The API server creates the order first (price and
+// content from ITS configuration), then Cashi is asked for that exact amount. Credits are added
+// only when the payment is verified (webhook or Refresh status) for that order and amount.
+async function startCreditPurchase(chatId, telegramId, request) {
+  if (!CASHI_API_KEY) {
+    await telegram('sendMessage', { chat_id: chatId, text: '\u{26A0}\u{FE0F} Pembayaran Cashi belum dikonfigurasi (CASHI_API_KEY kosong).', reply_markup: menuKeyboard(telegramId) });
+    return;
+  }
+  let order;
+  try {
+    order = await createCreditOrder(telegramId, request);
+  } catch (error) {
+    await telegram('sendMessage', { chat_id: chatId, text: `\u{274C} ${escapeHtml(error.message)}`, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '\u{1F519} Kredit Token', callback_data: 'credits' }]] } });
+    return;
+  }
+  let result;
+  try {
+    result = await cashiCreatePayment(order.orderId, order.priceIdr);
+  } catch (error) {
+    console.error('[cashi]', error.message);
+    await markCreditOrderFailed(order.orderId, error.message).catch(() => {});
+    await telegram('sendMessage', { chat_id: chatId, text: `\u{274C} Pembayaran gagal dibuat: ${escapeHtml(error.message)}`, parse_mode: 'HTML', reply_markup: menuKeyboard(telegramId) });
+    return;
+  }
+  const what = order.kind === 'credits'
+    ? `Paket: <b>${bigNumber(order.credits)} kredit token</b>`
+    : `Paket: <b>${escapeHtml(order.name || 'Unlimited')} ${formatTokens(order.hours)} jam</b>`;
+  const caption = [
+    '\u{2705} <b>QR pembayaran siap</b>',
+    '',
+    what,
+    `Harga: <b>${rupiah(order.priceIdr)}</b>`,
+    `Order: <code>${escapeHtml(order.orderId)}</code>`,
+    '',
+    order.kind === 'credits'
+      ? 'Scan QR untuk membayar. Kredit masuk otomatis setelah pembayaran terverifikasi.'
+      : 'Scan QR untuk membayar. Paket aktif setelah pembayaran terverifikasi.',
+  ].join('\n');
+  try {
+    await sendCashiQr(chatId, result, caption, order.orderId);
+  } catch (error) {
+    // The Cashi order exists: keep it payable and tell the user how to continue.
+    console.error('[cashi qr]', error.message);
+    const link = result.checkout_url ? `\n\nBuka link pembayaran: ${escapeHtml(result.checkout_url)}` : '';
+    await telegram('sendMessage', {
+      chat_id: chatId,
+      text: `\u{26A0}\u{FE0F} QR tidak bisa ditampilkan (${escapeHtml(error.message)}).${link}\nOrder: <code>${escapeHtml(order.orderId)}</code>`,
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: '\u{1F504} Refresh status', callback_data: `status_${order.orderId}` }], [{ text: '\u{1F519} Back to menu', callback_data: 'menu' }]] },
+    });
+  }
+}
+
+const PAYMENT_PROBLEMS = {
+  amount_mismatch: '\u{26A0}\u{FE0F} Jumlah yang dibayar tidak sesuai harga paket, jadi kredit belum ditambahkan. Hubungi admin lewat ticket dengan menyertakan nomor order.',
+  amount_missing: '\u{23F3} Pembayaran tercatat lunas, tapi jumlahnya belum bisa diverifikasi. Admin akan memeriksa; hubungi admin lewat ticket bila perlu.',
+};
+
 async function refreshCashiStatus(chatId, telegramId, orderId) {
   if (!CASHI_API_KEY) {
     await telegram('sendMessage', { chat_id: chatId, text: '\u{26A0}\u{FE0F} Cashi payments are not configured yet.' });
     return;
   }
-  const order = await getOrder(telegramId, orderId);
+  const creditOrder = await getCreditOrder(telegramId, orderId).catch(() => null);
+  const order = creditOrder || await getOrder(telegramId, orderId);
   if (!order) {
     await telegram('sendMessage', { chat_id: chatId, text: '\u{274C} Payment order not found.', reply_markup: menuKeyboard() });
     return;
   }
+  const refreshMarkup = { inline_keyboard: [[{ text: '\u{1F504} Refresh status', callback_data: `status_${orderId}` }], [{ text: '\u{1F519} Back to menu', callback_data: 'menu' }]] };
   try {
     const response = await fetch(`https://cashi.id/api/check-status/${encodeURIComponent(orderId)}`, { headers: { 'x-api-key': CASHI_API_KEY } });
     const result = await response.json();
     if (!response.ok || !result.success) throw new Error(result.message || `Cashi returned ${response.status}`);
     const status = String(result.status || 'UNKNOWN').toUpperCase();
+    if (creditOrder) {
+      if (status !== 'SETTLED' && creditOrder.status !== 'SETTLED') {
+        await telegram('sendMessage', { chat_id: chatId, text: `\u{23F3} <b>Status pembayaran: ${escapeHtml(status)}</b>\n\nOrder: <code>${escapeHtml(orderId)}</code>\nSelesaikan pembayaran QR, lalu tekan Refresh lagi.`, parse_mode: 'HTML', reply_markup: refreshMarkup });
+        return;
+      }
+      // Verified with Cashi just now (status and amount of THIS order id); credited at most once.
+      const settled = creditOrder.status === 'SETTLED' ? { alreadySettled: true } : await settlePayment(orderId, result.amount, status, { source: 'bot_refresh' });
+      if (settled?.reason && PAYMENT_PROBLEMS[settled.reason]) {
+        await telegram('sendMessage', { chat_id: chatId, text: `${PAYMENT_PROBLEMS[settled.reason]}\n\nOrder: <code>${escapeHtml(orderId)}</code>`, parse_mode: 'HTML', reply_markup: menuKeyboard(telegramId) });
+        return;
+      }
+      const overview = await getCreditOverview(telegramId).catch(() => null);
+      const pass = overview?.passes?.active?.[0] || overview?.passes?.scheduled?.[0];
+      const lines = creditOrder.kind === 'credits'
+        ? [`\u{2705} <b>Pembayaran terverifikasi!</b>`, '', `+<b>${bigNumber(creditOrder.credits)}</b> kredit token`, `Saldo kredit: <b>${bigNumber(overview?.account.available ?? 0)}</b>`]
+        : [`\u{2705} <b>Paket unlimited aktif!</b>`, '', pass ? `Berlaku: <b>${escapeHtml(wibTime(pass.startsAt))}</b> s/d <b>${escapeHtml(wibTime(pass.endsAt))}</b>` : ''];
+      await telegram('sendMessage', { chat_id: chatId, text: [...lines, `Order: <code>${escapeHtml(orderId)}</code>`].filter(Boolean).join('\n'), parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '\u{1F48E} Kredit Token', callback_data: 'credits' }], [{ text: '\u{1F519} Back to menu', callback_data: 'menu' }]] } });
+      return;
+    }
     if (status === 'SETTLED') await settleOrder(orderId, result.amount);
     const updated = await getUser(telegramId);
     const balance = Number(updated?.balance || 0).toLocaleString('id-ID');
@@ -1249,12 +1379,518 @@ async function refreshCashiStatus(chatId, telegramId, orderId) {
         ? `\u{2705} <b>Payment settled!</b>\n\nOrder: <code>${escapeHtml(orderId)}</code>\nBalance: <b>Rp${balance}</b>`
         : `\u{23F3} <b>Payment status: ${escapeHtml(status)}</b>\n\nOrder: <code>${escapeHtml(orderId)}</code>\nComplete the QR payment, then refresh again.`,
       parse_mode: 'HTML',
-      reply_markup: status === 'SETTLED' ? menuKeyboard() : { inline_keyboard: [[{ text: '\u{1F504} Refresh status', callback_data: `status_${orderId}` }], [{ text: '\u{1F519} Back to menu', callback_data: 'menu' }]] },
+      reply_markup: status === 'SETTLED' ? menuKeyboard() : refreshMarkup,
     });
   } catch (error) {
     console.error('[cashi status]', error.message);
     await telegram('sendMessage', { chat_id: chatId, text: `\u{274C} Could not check payment status: ${escapeHtml(error.message)}`, parse_mode: 'HTML' });
   }
+}
+
+// ---------- Token credits (menu: Kredit Token, /kredit; Admin Panel -> Kredit & Paket) ----------
+// Everything here reads the API server's credit store and configuration (credit-store.js,
+// credit-config.js). Credits are a separate balance from the old Rupiah saldo. Paid models are
+// never shown as free: a model without a rate shows "menunggu konfigurasi".
+const CREDIT_HISTORY_SHOWN = 15;
+const CREDIT_UNAVAILABLE = '\u{26A0}\u{FE0F} Fitur kredit token belum aktif di server. Upload credit-rules.js, credit-config.js, credit-store.js, server.js dan usage-db.js terbaru ke server API, lalu restart.';
+
+function multiplierText(value) {
+  return `\u{00D7}${String(value).replace('.', ',')}`;
+}
+
+// About how many tokens `credits` buys at multiplier `value` ("1.75").
+function tokensAt(credits, value) {
+  try {
+    return creditRules.tokensForCredits(credits, creditRules.parseMultiplier(value));
+  } catch (_) {
+    return 0;
+  }
+}
+
+function creditBackRow() {
+  return [{ text: '\u{1F519} Kredit Token', callback_data: 'credits' }, { text: '\u{1F3E0} Menu', callback_data: 'menu' }];
+}
+
+function shortTime(iso) {
+  const time = wibLogTime(iso);
+  return /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(time) ? `${time.slice(8, 10)}/${time.slice(5, 7)} ${time.slice(11, 16)}` : time;
+}
+
+function unlimitedTerms(source) {
+  const limits = source.limits || {};
+  return [
+    `Model yang termasuk: ${source.models?.length ? source.models.map((model) => `<code>${escapeHtml(model)}</code>`).join(', ') : '<i>belum ada</i>'}`,
+    `Maks <b>${formatTokens(limits.maxConcurrent)}</b> request bersamaan, <b>${formatTokens(limits.rpm)}</b> request/menit`,
+    `Output maks <b>${formatTokens(limits.maxOutputTokens)}</b> token per request`,
+    'Model yang tercakup tidak memotong kredit selama paket aktif',
+    'Model lain tetap memakai kredit token seperti biasa',
+  ];
+}
+
+async function creditMainView(telegramId) {
+  const [overview, catalog] = await Promise.all([getCreditOverview(telegramId), getCreditCatalog()]);
+  const { account, legacy, passes } = overview;
+  const basis = account.available > 0 ? account.available : (catalog.packages.find((item) => item.active)?.credits || 10_000_000);
+  // One example model per distinct multiplier, lowest first.
+  const examples = new Map();
+  for (const entry of catalog.models) {
+    if (entry.status === 'active' && entry.listed && !examples.has(entry.multiplier)) examples.set(entry.multiplier, entry);
+  }
+  const exampleLines = [...examples.values()]
+    .sort((a, b) => a.multiplierUnits - b.multiplierUnits)
+    .map((entry) => `${multiplierText(entry.multiplier)} \u{2248} <b>${shortNumber(tokensAt(basis, entry.multiplier))}</b> token <i>(mis. ${escapeHtml(entry.model)})</i>`);
+  const lines = [
+    '\u{1F48E} <b>KREDIT TOKEN</b>',
+    DIVIDER,
+    card('\u{1F4B3} <b>Saldo kredit</b>', [
+      `Tersedia: <b>${bigNumber(account.available)}</b> kredit`,
+      `Sedang direservasi: <b>${bigNumber(account.reserved)}</b> kredit${account.reserved > 0 ? ' <i>(request yang sedang berjalan)</i>' : ''}`,
+      account.purchased > 0 && `Total dibeli: ${bigNumber(account.purchased)} \u{2022} terpakai: ${bigNumber(account.used)}`,
+    ]),
+  ];
+  for (const pass of [...passes.active, ...passes.scheduled].slice(0, 2)) {
+    lines.push(card(`\u{267E}\u{FE0F} <b>${escapeHtml(pass.name || 'Unlimited')}</b> ${pass.status === 'active' ? '(aktif)' : '(menunggu mulai)'}`, [
+      `${escapeHtml(wibTime(pass.startsAt))} \u{2192} <b>${escapeHtml(wibTime(pass.endsAt))}</b>`,
+      `Model: ${pass.models.map((model) => `<code>${escapeHtml(model)}</code>`).join(', ')}`,
+    ]));
+  }
+  if (legacy.balance > 0 || legacy.bonusTokens > 0) {
+    lines.push(card('\u{1F4B0} <b>Saldo lama (terpisah)</b>', [
+      legacy.balance > 0 && `Saldo Rupiah: <b>${rupiah(legacy.balance)}</b>`,
+      legacy.bonusTokens > 0 && `Bonus token: <b>${bigNumber(legacy.bonusTokens)}</b>`,
+      'Belum dikonversi ke kredit. Dipakai dengan harga lama bila kredit kamu habis.',
+    ]));
+  }
+  lines.push(
+    '',
+    '\u{2139}\u{FE0F} <b>Cara kerja kredit token</b>',
+    'Kredit terpakai = (token input + token output) \u{00D7} multiplier model.',
+    '1 kredit = 1 token di model \u{00D7}1. Jumlah token yang benar-benar bisa kamu pakai = kredit \u{00F7} multiplier.',
+    'Contoh: 100.000 token di <code>glm-5.2</code> (\u{00D7}1,75) = 175.000 kredit.',
+    '',
+    `\u{1F4CA} <b>Estimasi dari ${account.available > 0 ? 'saldo kamu' : `paket ${shortNumber(basis)} kredit`}</b>`,
+    ...(exampleLines.length ? exampleLines : ['<i>Belum ada model dengan tarif aktif.</i>']),
+    '',
+    '<i>Kredit tidak kedaluwarsa. Request kecil membayar sesuai pemakaiannya saja.</i>',
+  );
+  const rows = [
+    [{ text: '\u{1F6D2} Beli kredit', callback_data: 'top_up' }, { text: '\u{1F4CB} Model & multiplier', callback_data: 'cr_models' }],
+    [{ text: '\u{1F9FE} Riwayat kredit', callback_data: 'cr_hist' }, { text: '\u{267E}\u{FE0F} Paket Unlimited', callback_data: 'cr_ul' }],
+    [{ text: '\u{1F504} Refresh', callback_data: 'credits' }, { text: '\u{1F3E0} Menu', callback_data: 'menu' }],
+  ];
+  return { text: lines.join('\n'), reply_markup: { inline_keyboard: rows } };
+}
+
+async function creditBuyView() {
+  const catalog = await getCreditCatalog();
+  const packages = catalog.packages.filter((item) => item.active);
+  const lines = ['\u{1F6D2} <b>BELI KREDIT TOKEN</b>', DIVIDER];
+  const rows = [];
+  if (!catalog.billing.creditSalesEnabled || !packages.length) {
+    lines.push('Penjualan kredit sedang ditutup. Silakan coba lagi nanti.');
+  } else {
+    lines.push('Pilih paket. Kredit masuk otomatis setelah pembayaran terverifikasi dan <b>tidak kedaluwarsa</b>.', '');
+    for (const item of packages) {
+      lines.push(`\u{1F48E} <b>${bigNumber(item.credits)} kredit</b> \u{2014} <b>${rupiah(item.priceIdr)}</b>`,
+        `   \u{2248} ${shortNumber(tokensAt(item.credits, '1'))} token di model \u{00D7}1 \u{2022} \u{2248} ${shortNumber(tokensAt(item.credits, '1.75'))} token di \u{00D7}1,75`);
+      rows.push([{ text: `\u{1F48E} ${shortNumber(item.credits)} kredit \u{2022} ${rupiah(item.priceIdr)}`, callback_data: `crbuy_${item.id}` }]);
+    }
+    lines.push('', '<i>Token aktual tergantung multiplier model yang kamu pakai.</i>');
+  }
+  if (catalog.unlimited.saleEnabled) rows.push([{ text: `\u{267E}\u{FE0F} ${catalog.unlimited.name}`, callback_data: 'cr_ul' }]);
+  if (catalog.billing.legacyTopupEnabled) rows.push([{ text: '\u{1F4B5} Top up saldo Rupiah (lama)', callback_data: 'top_up_rp' }]);
+  rows.push(creditBackRow());
+  return { text: lines.join('\n'), reply_markup: { inline_keyboard: rows } };
+}
+
+async function creditModelsView(telegramId) {
+  const [catalog, overview, disabled, access] = await Promise.all([
+    getCreditCatalog(),
+    getCreditOverview(telegramId).catch(() => null),
+    getDisabledModels(),
+    getModelAccess(telegramId).catch(() => null),
+  ]);
+  const unlocked = new Set(access?.granted ? access.models : []);
+  const covered = new Set((overview?.passes?.active || []).flatMap((pass) => pass.models));
+  const available = overview?.account.available || 0;
+  const basis = available > 0 ? available : 10_000_000;
+  const visible = catalog.models.filter((entry) => entry.listed && (!isDisabledIn(disabled, entry.model) || unlocked.has(entry.model)));
+  const sections = MODEL_FAMILIES.map((family) => {
+    const list = visible.filter((entry) => entry.family === family);
+    if (!list.length) return '';
+    const lines = list.map((entry) => {
+      const name = `<code>${escapeHtml(entry.model)}</code>${covered.has(entry.model) ? ' \u{267E}\u{FE0F}' : ''}`;
+      if (entry.status === 'active') {
+        const via = entry.routedTo ? ` <i>(\u{2192} ${escapeHtml(entry.routedTo)})</i>` : (entry.alias && entry.rateModel !== entry.model ? ` <i>(alias \u{2192} ${escapeHtml(entry.rateModel)})</i>` : '');
+        const tool = entry.toolCallCredits ? ` + ${formatTokens(entry.toolCallCredits)} kredit/tool` : '';
+        return `\u{2022} ${name} ${multiplierText(entry.multiplier)}${via}${tool} \u{2014} \u{00B1}${shortNumber(tokensAt(basis, entry.multiplier))}`;
+      }
+      return `\u{2022} ${name} \u{23F3} <i>${entry.status === 'alias' ? 'alias, menunggu mapping admin' : 'menunggu konfigurasi'}</i>`;
+    });
+    return `<b>${family}</b>\n${lines.join('\n')}`;
+  }).filter(Boolean);
+  const header = [
+    '\u{1F4CB} <b>MODEL &amp; MULTIPLIER</b>',
+    DIVIDER,
+    'Kredit terpakai = (token input + token output) \u{00D7} multiplier. Angka ini tarif jual toko ini, bukan harga resmi provider.',
+    `Angka setelah \u{2014} = perkiraan token dari ${available > 0 ? `saldo kamu (${shortNumber(available)} kredit)` : '10 jt kredit'}.`,
+    covered.size > 0 && '\u{267E}\u{FE0F} = termasuk paket unlimited kamu (tidak memotong kredit).',
+    '\u{23F3} = belum bisa dipakai dengan kredit sampai admin mengatur tarifnya.',
+  ].filter(Boolean).join('\n');
+  let text = `${header}\n\n${sections.join('\n\n')}`;
+  if (text.length > 4000) text = `${text.slice(0, 3980)}\n\u{2026}`;
+  return { text, reply_markup: { inline_keyboard: [creditBackRow()] } };
+}
+
+function ledgerLine(entry) {
+  const when = escapeHtml(shortTime(entry.at));
+  const signed = (value) => `${value > 0 ? '+' : ''}${formatTokens(value)}`;
+  if (entry.type === 'purchase') {
+    return `\u{2795} ${when} \u{2022} Beli paket ${escapeHtml(entry.packageId || '')} (${rupiah(entry.priceIdr)})\n   <b>${signed(entry.credits)}</b> kredit \u{2192} saldo ${formatTokens(entry.balanceAfter)}`;
+  }
+  if (entry.type === 'usage') {
+    const flags = [entry.estimated && 'estimasi', entry.partial && 'terputus', entry.shortfall && `kurang ${formatTokens(entry.shortfall)}`].filter(Boolean).join(', ');
+    const rate = entry.rateModel && entry.rateModel !== entry.model ? ` tarif ${escapeHtml(entry.rateModel)}` : '';
+    return `\u{2796} ${when} \u{2022} <code>${escapeHtml(entry.model || '?')}</code> ${multiplierText(entry.multiplier)}${rate}\n   in ${formatTokens(entry.inputTokens)}${entry.cachedInputTokens ? ` (cache ${formatTokens(entry.cachedInputTokens)})` : ''} \u{2022} out ${formatTokens(entry.outputTokens)} \u{2192} <b>${signed(entry.credits)}</b>${flags ? ` <i>(${flags})</i>` : ''}`;
+  }
+  if (entry.type === 'refund') return `\u{21A9}\u{FE0F} ${when} \u{2022} Refund <b>${signed(entry.credits)}</b>${entry.reason ? ` \u{2014} ${escapeHtml(entry.reason)}` : ''}`;
+  if (entry.type === 'adjustment') return `\u{1F6E0}\u{FE0F} ${when} \u{2022} Penyesuaian admin <b>${signed(entry.credits)}</b>${entry.reason ? ` \u{2014} ${escapeHtml(entry.reason)}` : ''}`;
+  if (entry.type === 'unlimited_purchase') return `\u{267E}\u{FE0F} ${when} \u{2022} Paket unlimited ${formatTokens(entry.hours)} jam (${rupiah(entry.priceIdr)})\n   ${escapeHtml(shortTime(entry.startsAt))} \u{2192} ${escapeHtml(shortTime(entry.endsAt))}`;
+  return `${when} \u{2022} ${escapeHtml(entry.type)}`;
+}
+
+async function creditHistoryView(telegramId) {
+  const overview = await getCreditOverview(telegramId);
+  const recent = overview.recent.slice(0, CREDIT_HISTORY_SHOWN);
+  const pending = overview.orders.filter((order) => order.status === 'PENDING').slice(0, 3);
+  const lines = [
+    '\u{1F9FE} <b>RIWAYAT KREDIT</b>',
+    DIVIDER,
+    ...(recent.length ? recent.map(ledgerLine) : ['Belum ada transaksi kredit. \u{1F4ED}']),
+  ];
+  if (pending.length) {
+    lines.push('', '\u{23F3} <b>Menunggu pembayaran</b>', ...pending.map((order) => `\u{2022} <code>${escapeHtml(order.orderId)}</code> ${rupiah(order.priceIdr)}`));
+  }
+  lines.push('', '<i>Detail per request (token, multiplier, kredit) juga ada di menu Logs.</i>');
+  const rows = pending.map((order) => [{ text: `\u{1F504} Cek ${order.orderId.slice(-6)}`, callback_data: `status_${order.orderId}` }]);
+  rows.push([{ text: '\u{1F9FE} Logs', callback_data: 'logs' }], creditBackRow());
+  return { text: lines.join('\n'), reply_markup: { inline_keyboard: rows } };
+}
+
+async function creditUnlimitedView(telegramId) {
+  const [catalog, overview] = await Promise.all([getCreditCatalog(), getCreditOverview(telegramId).catch(() => null)]);
+  const unlimited = catalog.unlimited;
+  const mine = [...(overview?.passes?.active || []), ...(overview?.passes?.scheduled || [])];
+  const lines = [`\u{267E}\u{FE0F} <b>${escapeHtml(unlimited.name.toUpperCase())}</b>`, DIVIDER];
+  for (const pass of mine.slice(0, 3)) {
+    lines.push(card(`<b>Paket kamu</b> ${pass.status === 'active' ? '(aktif)' : '(menunggu mulai)'}`, [
+      `${escapeHtml(wibTime(pass.startsAt))} \u{2192} <b>${escapeHtml(wibTime(pass.endsAt))}</b>`,
+      ...unlimitedTerms(pass),
+    ]));
+  }
+  const forSale = unlimited.durations.filter((item) => item.active && item.priceIdr !== null);
+  if (!unlimited.saleEnabled || !forSale.length) {
+    lines.push('Penjualan paket unlimited <b>belum dibuka</b>: harga belum ditetapkan admin.');
+  } else {
+    lines.push('<b>Harga</b>', ...unlimited.durations.map((item) => `\u{2022} ${formatTokens(item.hours)} jam: ${item.active && item.priceIdr !== null ? `<b>${rupiah(item.priceIdr)}</b>` : '<i>belum dijual</i>'}`));
+  }
+  lines.push('', card('<b>Ketentuan</b>', [
+    ...unlimitedTerms(unlimited),
+    'Waktu dihitung sejak pembayaran terverifikasi; beli lagi saat aktif = mulai setelah paket sekarang berakhir',
+  ]));
+  const rows = unlimited.saleEnabled ? forSale.map((item) => [{ text: `\u{267E}\u{FE0F} ${formatTokens(item.hours)} jam \u{2022} ${rupiah(item.priceIdr)}`, callback_data: `ulbuy_${item.hours}` }]) : [];
+  rows.push(creditBackRow());
+  return { text: lines.join('\n'), reply_markup: { inline_keyboard: rows } };
+}
+
+// ----- Admin -----
+
+function adminCreditKeyboard() {
+  return { inline_keyboard: [
+    [{ text: '\u{2716}\u{FE0F} Multiplier', callback_data: 'admin_cr_rates' }, { text: '\u{1F500} Routing & alias', callback_data: 'admin_cr_routing' }],
+    [{ text: '\u{1F4E6} Paket, batas & billing', callback_data: 'admin_cr_limits' }, { text: '\u{267E}\u{FE0F} Unlimited', callback_data: 'admin_cr_ul' }],
+    [{ text: '\u{1F9FE} Order', callback_data: 'admin_cr_orders' }, { text: '\u{1F4DC} Audit', callback_data: 'admin_cr_audit' }],
+    [{ text: '\u{2328}\u{FE0F} Ketik perintah', callback_data: 'admin_cr_cmd' }],
+    [{ text: '\u{1F504} Refresh', callback_data: 'admin_cr' }, { text: '\u{1F519} Admin panel', callback_data: 'admin_panel' }],
+  ] };
+}
+
+function adminCreditSubKeyboard() {
+  return { inline_keyboard: [
+    [{ text: '\u{2328}\u{FE0F} Ketik perintah', callback_data: 'admin_cr_cmd' }],
+    [{ text: '\u{1F519} Kredit & Paket', callback_data: 'admin_cr' }],
+  ] };
+}
+
+async function adminCreditView(notice = '') {
+  const [admin, stats, catalog] = await Promise.all([getCreditAdmin(), getCreditStats(), getCreditCatalog()]);
+  const { config } = admin;
+  const listed = catalog.models.filter((entry) => entry.listed);
+  const pendingModels = listed.filter((entry) => entry.status !== 'active');
+  const routingRules = Object.values(config.routing).reduce((sum, rules) => sum + Object.keys(rules).length, 0);
+  const onOff = (on) => (on ? '\u{1F7E2} ON' : '\u{1F534} OFF');
+  const lines = [
+    ...(notice ? [notice, ''] : []),
+    `\u{1F48E} <b>KREDIT &amp; PAKET</b> <i>(config v${config.version})</i>`,
+    DIVIDER,
+    card('\u{1F4CA} <b>Statistik</b>', [
+      `Akun: <b>${formatTokens(stats.accounts)}</b> \u{2022} kredit beredar: <b>${bigNumber(stats.totalBalance)}</b>`,
+      `Direservasi: <b>${bigNumber(stats.totalReserved)}</b> (${formatTokens(stats.openReservations)} request)`,
+      `Terjual: <b>${bigNumber(stats.purchased)}</b> \u{2022} terpakai: <b>${bigNumber(stats.used)}</b>`,
+      `Pendapatan: <b>${rupiah(stats.revenueIdr)}</b> (kredit ${rupiah(stats.creditRevenueIdr)} \u{2022} unlimited ${rupiah(stats.unlimitedRevenueIdr)})`,
+      `Order: ${formatTokens(stats.settledOrders)} lunas \u{2022} ${formatTokens(stats.pendingOrders)} pending \u{2022} unlimited aktif: ${formatTokens(stats.activePasses)}`,
+      stats.shortfall > 0 && `\u{26A0}\u{FE0F} Tidak tertagih (saldo habis): ${bigNumber(stats.shortfall)}`,
+    ]),
+    card('\u{1F4E6} <b>Paket kredit</b>', config.packages.length
+      ? config.packages.map((item) => `${item.active ? '\u{1F7E2}' : '\u{1F534}'} <code>${escapeHtml(item.id)}</code> ${bigNumber(item.credits)} kredit \u{2022} ${rupiah(item.priceIdr)}`)
+      : ['Belum ada paket']),
+    card('\u{2699}\u{FE0F} <b>Billing</b>', [
+      `Jual kredit: <b>${onOff(config.billing.creditSalesEnabled)}</b> \u{2022} saldo Rupiah lama dipakai: <b>${onOff(config.billing.legacyRupiahEnabled)}</b>`,
+      `Top up Rupiah lama: <b>${onOff(config.billing.legacyTopupEnabled)}</b>`,
+      `Unlimited dijual: <b>${onOff(config.unlimited.saleEnabled)}</b> \u{2022} routing: <b>${formatTokens(routingRules)}</b> aturan`,
+    ]),
+    card('\u{1F916} <b>Model</b>', [
+      `Aktif: <b>${formatTokens(listed.length - pendingModels.length)}</b> \u{2022} menunggu konfigurasi: <b>${formatTokens(pendingModels.length)}</b>`,
+      pendingModels.length && pendingModels.slice(0, 12).map((entry) => `<code>${escapeHtml(entry.model)}</code>`).join(', '),
+    ]),
+    '<i>Semua perubahan memakai perintah teks (tombol Ketik perintah), diautentikasi dan dicatat di Audit.</i>',
+  ];
+  return { text: lines.join('\n'), reply_markup: adminCreditKeyboard() };
+}
+
+async function adminCreditRatesView() {
+  const [admin, catalog] = await Promise.all([getCreditAdmin(), getCreditCatalog()]);
+  const { rates } = admin.config;
+  const describe = (entry) => {
+    const rate = rates[entry.model];
+    if (entry.status === 'active') {
+      const parts = [multiplierText(entry.multiplier)];
+      if (entry.split) parts.push(`(in ${multiplierText(creditRules.formatMultiplier(entry.units.input))} cache ${multiplierText(creditRules.formatMultiplier(entry.units.cachedInput))} out ${multiplierText(creditRules.formatMultiplier(entry.units.output))})`);
+      if (entry.routedTo) parts.push(`route ${escapeHtml(entry.provider)}\u{2192}${escapeHtml(entry.routedTo)}`);
+      else if (entry.alias) parts.push(`alias\u{2192}${escapeHtml(entry.rateModel)}`);
+      if (entry.toolCallCredits) parts.push(`tool ${formatTokens(entry.toolCallCredits)}`);
+      return parts.join(' ');
+    }
+    if (rate?.status === 'alias') {
+      const efforts = Object.entries(rate.effortTargets || {}).map(([effort, target]) => `${effort}\u{2192}${target}`).join(', ');
+      return `\u{23F3} alias\u{2192}${escapeHtml(rate.target || '?')}${efforts ? ` [${escapeHtml(efforts)}]` : ''}${rate.requiresToolPrice ? ` tool ${rate.toolCallCredits === null ? '?' : formatTokens(rate.toolCallCredits)}` : ''}`;
+    }
+    return `\u{23F3} ${escapeHtml(entry.reason || 'menunggu konfigurasi')}`;
+  };
+  const sections = MODEL_FAMILIES.map((family) => {
+    const list = catalog.models.filter((entry) => entry.family === family);
+    if (!list.length) return '';
+    return `<b>${family}</b>\n${list.map((entry) => `\u{2022} <code>${escapeHtml(entry.model)}</code>${entry.listed ? '' : ' <i>(tidak di upstream)</i>'} ${describe(entry)}`).join('\n')}`;
+  }).filter(Boolean);
+  let text = [
+    '\u{2716}\u{FE0F} <b>MULTIPLIER MODEL</b>',
+    '<i>Tarif jual, bukan harga resmi provider. Ubah: </i><code>tarif &lt;model&gt; &lt;multiplier&gt;</code>',
+    '',
+    sections.join('\n\n'),
+  ].join('\n');
+  if (text.length > 4000) text = `${text.slice(0, 3980)}\n\u{2026}`;
+  return { text, reply_markup: adminCreditSubKeyboard() };
+}
+
+async function adminCreditRoutingView() {
+  const admin = await getCreditAdmin();
+  const { config, providers } = admin;
+  const rules = Object.entries(config.routing).flatMap(([provider, map]) => Object.entries(map).map(([model, target]) => `<code>${escapeHtml(provider)}</code>: ${escapeHtml(model)} \u{2192} <b>${escapeHtml(target)}</b>`));
+  const deepseek = Object.entries(config.rates).filter(([model]) => model.startsWith('deepseek-'))
+    .map(([model, rate]) => `<code>${escapeHtml(model)}</code> ${rate.status === 'active' ? multiplierText(rate.multiplier) : '\u{23F3}'} <i>${rate.type === 'checkpoint' ? 'checkpoint asli' : rate.type === 'alias' ? 'alias' : ''}</i>`);
+  const aliases = Object.entries(config.rates).filter(([, rate]) => rate.status === 'alias')
+    .map(([model, rate]) => `<code>${escapeHtml(model)}</code> \u{2192} ${rate.target ? `<b>${escapeHtml(rate.target)}</b>` : '<i>belum diatur</i>'}${rate.requiresToolPrice ? ` \u{2022} tool: ${rate.toolCallCredits === null ? '<i>belum diatur</i>' : formatTokens(rate.toolCallCredits)}` : ''}${Object.keys(rate.effortTargets || {}).length ? ` \u{2022} effort: ${escapeHtml(Object.entries(rate.effortTargets).map(([e, t]) => `${e}\u{2192}${t}`).join(', '))}` : ''}`);
+  const lines = [
+    '\u{1F500} <b>ROUTING &amp; ALIAS</b>',
+    DIVIDER,
+    'Routing per provider: catat bila provider mengarahkan suatu alias ke model lain. Tarif model tujuan yang dipakai, hanya untuk provider itu.',
+    'Contoh: <code>route cbcn deepseek-v4-flash deepseek-v4.1-flash</code> (tarif \u{00D7}1,5).',
+    '',
+    card('<b>Aturan routing</b>', rules.length ? rules : ['Belum ada (semua provider memakai tarif model itu sendiri)']),
+    card('<b>Provider di daftar model</b>', Object.entries(providers).map(([provider, models]) => `<code>${escapeHtml(provider)}</code>: ${formatTokens(models.length)} model`)),
+    card('<b>DeepSeek</b>', deepseek),
+    card('<b>Alias</b> (<code>alias</code>, <code>effort</code>, <code>tool</code>)', aliases.length ? aliases : ['-']),
+  ];
+  return { text: lines.join('\n'), reply_markup: adminCreditSubKeyboard() };
+}
+
+async function adminCreditLimitsView() {
+  const { config } = await getCreditAdmin();
+  const limits = config.limits;
+  const lines = [
+    '\u{1F4E6} <b>PAKET, BATAS &amp; BILLING</b>',
+    DIVIDER,
+    card('<b>Paket</b> (<code>paket &lt;id&gt; &lt;kredit&gt; &lt;harga&gt;</code>, <code>paket &lt;id&gt; on|off|hapus</code>)', config.packages.map((item) => `${item.active ? '\u{1F7E2}' : '\u{1F534}'} <code>${escapeHtml(item.id)}</code> ${bigNumber(item.credits)} kredit \u{2022} ${rupiah(item.priceIdr)}`)),
+    card('<b>Batas reservasi</b> (<code>batas &lt;nama&gt; &lt;nilai&gt;</code>)', [
+      `output_default: <b>${formatTokens(limits.defaultReserveOutputTokens)}</b> token (direservasi bila klien tidak memberi batas)`,
+      `output_min: <b>${formatTokens(limits.minOutputTokens)}</b> token (di bawah ini request ditolak 402)`,
+      `input_buffer: <b>${formatTokens(limits.inputSafetyPercent)}%</b> (cadangan estimasi input)`,
+      `max_tokens_field: <b>${escapeHtml(limits.chatMaxTokensField)}</b> (chat/completions)`,
+      `ttl: <b>${formatTokens(limits.reservationTtlMinutes)}</b> menit \u{2022} orphan: <b>${escapeHtml(limits.orphanPolicy)}</b>`,
+      `tool_reserve: <b>${formatTokens(limits.toolCallReserve)}</b> tool call`,
+    ]),
+    card('<b>Billing</b> (<code>billing &lt;nama&gt; on|off</code>)', [
+      `jual_kredit: <b>${config.billing.creditSalesEnabled ? 'on' : 'off'}</b>`,
+      `legacy_rupiah: <b>${config.billing.legacyRupiahEnabled ? 'on' : 'off'}</b> (saldo Rupiah lama dipakai bila kredit habis)`,
+      `legacy_topup: <b>${config.billing.legacyTopupEnabled ? 'on' : 'off'}</b> (tombol top up Rupiah lama)`,
+    ]),
+  ];
+  return { text: lines.join('\n'), reply_markup: adminCreditSubKeyboard() };
+}
+
+async function adminCreditUnlimitedView() {
+  const { config } = await getCreditAdmin();
+  const unlimited = config.unlimited;
+  const lines = [
+    `\u{267E}\u{FE0F} <b>${escapeHtml(unlimited.name.toUpperCase())}</b> (admin)`,
+    DIVIDER,
+    `Dijual: <b>${unlimited.saleEnabled ? '\u{1F7E2} ON' : '\u{1F534} OFF'}</b> (<code>unlimited jual on|off</code>)`,
+    card('<b>Durasi &amp; harga</b> (<code>unlimited harga &lt;jam&gt; &lt;harga&gt;</code>, <code>unlimited &lt;jam&gt; on|off</code>)', unlimited.durations.map((item) => `${item.active ? '\u{1F7E2}' : '\u{1F534}'} ${formatTokens(item.hours)} jam: ${item.priceIdr === null ? '<i>harga belum ditetapkan</i>' : rupiah(item.priceIdr)}`)),
+    card('<b>Model</b> (<code>unlimited model tambah|hapus &lt;model&gt;</code>)', [unlimited.models.length ? unlimited.models.map((model) => `<code>${escapeHtml(model)}</code>`).join(', ') : '<i>kosong: tidak ada model yang otomatis masuk</i>']),
+    card('<b>Batas per user</b> (<code>unlimited batas concurrency|rpm|output &lt;nilai&gt;</code>)', [
+      `Request bersamaan: <b>${formatTokens(unlimited.limits.maxConcurrent)}</b>`,
+      `Request per menit: <b>${formatTokens(unlimited.limits.rpm)}</b>`,
+      `Output maks per request: <b>${formatTokens(unlimited.limits.maxOutputTokens)}</b> token`,
+    ]),
+    '<i>Model, batas dan harga disalin ke paket saat dibeli; perubahan berlaku untuk pembelian berikutnya.</i>',
+  ];
+  return { text: lines.join('\n'), reply_markup: adminCreditSubKeyboard() };
+}
+
+async function adminCreditOrdersView() {
+  const [pending, recent] = await Promise.all([listCreditOrders({ status: 'PENDING', limit: 10 }), listCreditOrders({ limit: 10 })]);
+  const line = (order) => `${order.status === 'SETTLED' ? '\u{2705}' : order.status === 'FAILED' ? '\u{274C}' : '\u{23F3}'} <code>${escapeHtml(order.orderId)}</code>\n   ${order.kind === 'credits' ? `${bigNumber(order.credits)} kredit` : `unlimited ${formatTokens(order.hours)} jam`} \u{2022} ${rupiah(order.priceIdr)} \u{2022} user <code>${escapeHtml(order.userId)}</code>${order.lastRejectedAt ? ` \u{2022} \u{26A0}\u{FE0F} ditolak (dibayar ${order.lastRejectedAmount ?? '?'})` : ''}`;
+  const lines = [
+    '\u{1F9FE} <b>ORDER KREDIT</b>',
+    DIVIDER,
+    '<b>Pending</b>',
+    ...(pending.length ? pending.map(line) : ['Tidak ada.']),
+    '',
+    '<b>Terbaru</b>',
+    ...(recent.length ? recent.map(line) : ['Belum ada order.']),
+    '',
+    '<i>Konfirmasi manual (setelah kamu cek pembayarannya sendiri):</i> <code>order &lt;order id&gt; konfirmasi</code>',
+  ];
+  return { text: lines.join('\n').slice(0, 4000), reply_markup: adminCreditSubKeyboard() };
+}
+
+async function adminCreditAuditView() {
+  const { audit } = await getCreditAdmin();
+  const lines = [
+    '\u{1F4DC} <b>AUDIT KONFIGURASI KREDIT</b>',
+    DIVIDER,
+    ...(audit.length ? audit.map((entry) => `v${entry.version} \u{2022} ${escapeHtml(shortTime(entry.at))} \u{2022} <code>${escapeHtml(entry.by)}</code>\n   ${escapeHtml(entry.change)}`) : ['Belum ada perubahan (semua nilai default).']),
+    '',
+    '<i>Penyesuaian kredit user dan refund tercatat di ledger kredit.</i>',
+  ];
+  return { text: lines.join('\n').slice(0, 4000), reply_markup: adminCreditSubKeyboard() };
+}
+
+function adminCreditHelpText() {
+  return [
+    '\u{2328}\u{FE0F} <b>Perintah kredit</b> \u{2014} kirim satu perintah per baris (boleh beberapa baris sekaligus).',
+    '',
+    `<code>${escapeHtml(creditRules.ADMIN_COMMAND_HELP.join('\n'))}</code>`,
+    '',
+    'Mode ini aktif sampai kamu menekan tombol lain.',
+  ].join('\n');
+}
+
+async function notifyCreditUser(telegramId, text) {
+  await telegram('sendMessage', { chat_id: telegramId, text, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '\u{1F48E} Kredit Token', callback_data: 'credits' }]] } }).catch(() => {});
+}
+
+// One admin command line -> result line (HTML).
+async function runAdminCreditCommand(adminId, parsed, line) {
+  if (parsed.error) return `\u{274C} <code>${escapeHtml(line.slice(0, 80))}</code>\n   ${escapeHtml(parsed.error)}`;
+  try {
+    if (parsed.kind === 'config') {
+      const result = await updateCreditConfig(parsed.change, adminId);
+      return `\u{2705} v${result.version}: <code>${escapeHtml(result.summary)}</code>`;
+    }
+    if (parsed.kind === 'adjust' || parsed.kind === 'refund') {
+      const options = { actorId: adminId, reason: parsed.reason };
+      const result = parsed.kind === 'adjust'
+        ? await adjustCredits(parsed.userId, parsed.amount, options)
+        : await refundCredits(parsed.userId, parsed.amount, options);
+      const amount = `${parsed.amount > 0 ? '+' : ''}${formatTokens(parsed.amount)}`;
+      await notifyCreditUser(parsed.userId, `\u{1F48E} <b>Kredit kamu ${parsed.kind === 'refund' ? 'di-refund' : 'disesuaikan admin'}: ${amount}</b>${parsed.reason ? `\nAlasan: ${escapeHtml(parsed.reason)}` : ''}\nSaldo kredit: <b>${bigNumber(result.available)}</b>`);
+      return `\u{2705} ${parsed.kind === 'refund' ? 'Refund' : 'Kredit'} <code>${escapeHtml(parsed.userId)}</code> ${amount} \u{2192} saldo ${bigNumber(result.balance)}`;
+    }
+    if (parsed.kind === 'confirmOrder') {
+      const result = await adminConfirmCreditOrder(parsed.orderId, adminId);
+      if (result.alreadySettled) return `\u{2139}\u{FE0F} Order <code>${escapeHtml(parsed.orderId)}</code> sudah lunas sebelumnya.`;
+      await notifyCreditUser(result.userId, result.kind === 'credits'
+        ? `\u{2705} <b>Pembayaran dikonfirmasi admin.</b>\n+${bigNumber(result.credits)} kredit token. Saldo: <b>${bigNumber(result.balance)}</b>`
+        : `\u{2705} <b>Pembayaran dikonfirmasi admin.</b>\nPaket unlimited aktif ${escapeHtml(wibTime(result.pass?.startsAt))} s/d ${escapeHtml(wibTime(result.pass?.endsAt))}.`);
+      return `\u{2705} Order <code>${escapeHtml(parsed.orderId)}</code> dikonfirmasi (${result.kind === 'credits' ? `+${formatTokens(result.credits)} kredit` : 'unlimited'}).`;
+    }
+  } catch (error) {
+    return `\u{274C} <code>${escapeHtml(line.slice(0, 80))}</code>\n   ${escapeHtml(error.message)}`;
+  }
+  return `\u{274C} <code>${escapeHtml(line.slice(0, 80))}</code>`;
+}
+
+async function handleAdminCreditInput(chatId, adminId, text) {
+  const pending = pendingAdminCredit.get(adminId) || { mode: 'console' };
+  const lines = String(text || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean).slice(0, 20);
+  const results = [];
+  for (const line of lines) {
+    let parsed;
+    if (pending.mode === 'user') {
+      const refund = line.match(/^refund\s+(\S+)(?:\s+(.*))?$/i);
+      parsed = creditRules.parseAdminCommand(refund ? `refund ${pending.targetId} ${refund[1]} ${refund[2] || ''}` : `kredit ${pending.targetId} ${line}`);
+    } else {
+      parsed = creditRules.parseAdminCommand(line);
+    }
+    results.push(await runAdminCreditCommand(adminId, parsed, line));
+  }
+  if (pending.mode === 'user') {
+    pendingAdminCredit.delete(adminId);
+    return sendAdminUserDetail(chatId, adminId, pending.targetId, results.join('\n'));
+  }
+  return telegram('sendMessage', {
+    chat_id: chatId,
+    text: `${results.join('\n') || 'Tidak ada perintah.'}\n\n<i>Kirim perintah lagi, atau tekan tombol untuk selesai.</i>`.slice(0, 4000),
+    parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: [[{ text: '\u{2753} Bantuan perintah', callback_data: 'admin_cr_cmd' }], [{ text: '\u{1F519} Kredit & Paket', callback_data: 'admin_cr' }]] },
+  });
+}
+
+const ADMIN_CREDIT_VIEWS = {
+  admin_cr: adminCreditView,
+  admin_cr_rates: adminCreditRatesView,
+  admin_cr_routing: adminCreditRoutingView,
+  admin_cr_limits: adminCreditLimitsView,
+  admin_cr_ul: adminCreditUnlimitedView,
+  admin_cr_orders: adminCreditOrdersView,
+  admin_cr_audit: adminCreditAuditView,
+};
+
+async function handleAdminCreditAction(query, action) {
+  const chatId = query.message.chat.id;
+  const adminId = String(query.from.id);
+  if (action === 'admin_cr_cmd') {
+    pendingAdminCredit.set(adminId, { mode: 'console' });
+    return telegram('sendMessage', { chat_id: chatId, text: adminCreditHelpText(), parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '\u{1F519} Kredit & Paket', callback_data: 'admin_cr' }]] } });
+  }
+  if (action.startsWith('admin_cr_user_')) {
+    const targetId = action.slice('admin_cr_user_'.length);
+    if (!USER_ID_PATTERN.test(targetId)) return telegram('sendMessage', { chat_id: chatId, text: 'User tidak valid.', reply_markup: adminBackKeyboard() });
+    pendingAdminCredit.set(adminId, { mode: 'user', targetId });
+    return telegram('sendMessage', {
+      chat_id: chatId,
+      text: `\u{1F48E} Kirim penyesuaian kredit untuk <code>${escapeHtml(targetId)}</code>:\n<code>+10000000 bonus event</code> tambah kredit\n<code>-500000 koreksi</code> kurangi kredit (maks kredit tersedia)\n<code>refund 25000 request gagal</code> refund\n\nTercatat di ledger dengan ID admin dan alasannya.`,
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: '\u{1F519} Batal', callback_data: `admin_topup_user_${targetId}` }]] },
+    });
+  }
+  const view = ADMIN_CREDIT_VIEWS[action];
+  if (!view) return telegram('sendMessage', { chat_id: chatId, text: 'Unknown action.', reply_markup: adminBackKeyboard() });
+  const shown = await view();
+  return action === 'admin_cr' && !query.message.text?.includes('KREDIT &')
+    ? telegram('sendMessage', { chat_id: chatId, text: shown.text, parse_mode: 'HTML', reply_markup: shown.reply_markup })
+    : showAdminView(query, shown);
 }
 
 async function sendDashboard(chatId, telegramId, notice = '') {
@@ -3630,6 +4266,14 @@ async function handleCallbackQuery(query) {
       return telegram('sendMessage', { chat_id: chatId, text: `\u{274C} Kode Akses Model: ${escapeHtml(error.message)}`, parse_mode: 'HTML', reply_markup: adminBackKeyboard() });
     }
   }
+  if (action === 'admin_cr' || action.startsWith('admin_cr_')) {
+    try {
+      return await handleAdminCreditAction(query, action);
+    } catch (error) {
+      console.error('[credits] admin view failed:', error.message);
+      return telegram('sendMessage', { chat_id: chatId, text: `\u{274C} Kredit & Paket: ${escapeHtml(error.message)}\n\n${CREDIT_UNAVAILABLE}`, parse_mode: 'HTML', reply_markup: adminBackKeyboard() });
+    }
+  }
   if (action === 'ticket_close') {
     const open = await getOpenTicketForUser(userId);
     const closed = open ? await closeTicket(open.id, 'user') : null;
@@ -3843,7 +4487,9 @@ async function handleCallbackQuery(query) {
       const cost = ` cost=Rp${Number(entry.cost || 0).toLocaleString('id-ID', { maximumFractionDigits: 4 })}`;
       const balance = entry.balanceAfter === undefined ? '' : ` balance=Rp${Number(entry.balanceAfter || 0).toLocaleString('id-ID', { maximumFractionDigits: 2 })}`;
       const rate = entry.pricePerMillion ? ` rate=Rp${Number(entry.pricePerMillion).toLocaleString('id-ID')}/1M` : '';
-      return `${wibLogTime(entry.at)} ${entry.method} ${entry.path} → ${entry.status}${model}${user}${tokens}${rate}${cost}${balance}`;
+      const credit = entry.credits !== undefined ? ` credits=${Number(entry.credits || 0)} x${entry.multiplier || '?'}` : '';
+      const funding = entry.funding && entry.funding !== 'credits' ? ` paid=${entry.funding}` : '';
+      return `${wibLogTime(entry.at)} ${entry.method} ${entry.path} → ${entry.status}${model}${user}${tokens}${rate}${cost}${credit}${funding}${balance}`;
     });
     const logText = lines.join('\n').slice(-3500);
     const text = lines.length
@@ -3929,11 +4575,41 @@ async function handleCallbackQuery(query) {
     }
   }
 
-  if ((action === 'top_up' || action.startsWith('topup_')) && !await isPaymentsEnabled()) {
+  if (action === 'credits' || action === 'cr_models' || action === 'cr_hist' || action === 'cr_ul') {
+    const builders = { credits: creditMainView, cr_models: creditModelsView, cr_hist: creditHistoryView, cr_ul: creditUnlimitedView };
+    try {
+      const view = await builders[action](String(userId));
+      // Opened from a credit screen: replace it; from elsewhere (menu, /kredit): a new message.
+      const onCreditScreen = /KREDIT TOKEN|MODEL & MULTIPLIER|RIWAYAT KREDIT|UNLIMITED/.test(query.message?.text || '');
+      return onCreditScreen && query.id ? showAdminView(query, view) : telegram('sendMessage', { chat_id: chatId, text: view.text, parse_mode: 'HTML', reply_markup: view.reply_markup });
+    } catch (error) {
+      console.error('[credits] view failed:', error.message);
+      return telegram('sendMessage', { chat_id: chatId, text: CREDIT_UNAVAILABLE, reply_markup: menuKeyboard(userId) });
+    }
+  }
+
+  const paymentAction = action === 'top_up' || action === 'top_up_rp' || action.startsWith('topup_') || action.startsWith('crbuy_') || action.startsWith('ulbuy_');
+  if (paymentAction && !await isPaymentsEnabled()) {
     return telegram('sendMessage', { chat_id: chatId, text: PAYMENTS_OFF_MESSAGE, parse_mode: 'HTML', reply_markup: menuKeyboard(userId) });
   }
   if (action === 'top_up') {
+    // Token credit packages first; the old Rupiah top-up stays available behind its own button.
+    try {
+      const view = await creditBuyView();
+      return telegram('sendMessage', { chat_id: chatId, text: view.text, parse_mode: 'HTML', reply_markup: view.reply_markup });
+    } catch (error) {
+      console.error('[credits] buy view failed, showing the Rupiah top-up:', error.message);
+    }
     return telegram('sendMessage', { chat_id: chatId, text: '\u{1F4B3} <b>Top up balance</b>\n\nChoose an amount to pay securely with Cashi.id:', parse_mode: 'HTML', reply_markup: topUpKeyboard() });
+  }
+  if (action === 'top_up_rp') {
+    return telegram('sendMessage', { chat_id: chatId, text: '\u{1F4B5} <b>Top up saldo Rupiah (lama)</b>\n\nSaldo Rupiah terpisah dari kredit token dan dipakai dengan harga per 1M token lama.\nChoose an amount to pay securely with Cashi.id:', parse_mode: 'HTML', reply_markup: topUpKeyboard() });
+  }
+  if (action.startsWith('crbuy_')) {
+    return startCreditPurchase(chatId, String(userId), { kind: 'credits', packageId: action.slice('crbuy_'.length) });
+  }
+  if (action.startsWith('ulbuy_')) {
+    return startCreditPurchase(chatId, String(userId), { kind: 'unlimited', hours: Number(action.slice('ulbuy_'.length)) });
   }
   if (action.startsWith('topup_')) {
     const amount = Number(action.replace('topup_', ''));
@@ -3950,13 +4626,22 @@ async function handleCallbackQuery(query) {
       const input = Number(entry.inputTokens || 0);
       const output = Number(entry.outputTokens || 0);
       const total = input + output;
+      let billing;
+      if (entry.funding === 'credits') {
+        const rate = entry.rateModel && entry.rateModel !== stripModelPrefix(entry.model) ? ` tarif ${escapeHtml(entry.rateModel)}` : '';
+        billing = `💎 Kredit: <b>${formatTokens(entry.credits)}</b> (${multiplierText(entry.multiplier || '?')}${rate})${entry.shortfall ? ' ⚠️ saldo tidak cukup' : ''}${entry.partial ? ' <i>(stream terputus)</i>' : ''}`;
+      } else if (entry.funding === 'unlimited') {
+        billing = '♾️ Paket unlimited <i>(kredit tidak dipotong)</i>';
+      } else {
+        billing = `💰 Tarif: <b>Rp${formatTokens(entry.pricePerMillion)}/1M</b>\n💳 Biaya: <b>${formatCost(entry.cost)}</b>`;
+      }
       return [
         `<b>#${index + 1} ${entry.status >= 400 ? '❌' : '✅'} ${escapeHtml(entry.endpoint)}</b>`,
         `🕒 ${escapeHtml(entry.at)}`,
         `🤖 Model: <code>${escapeHtml(stripModelPrefix(entry.model) || 'unknown')}</code>`,
-        `📥 Input: <b>${formatTokens(input)}</b>  •  📤 Output: <b>${formatTokens(output)}</b>`,
-        `🔢 Total: <b>${formatTokens(total)}</b>${entry.estimated ? ' <i>(estimasi)</i>' : ''}  •  💰 Tarif: <b>Rp${formatTokens(entry.pricePerMillion)}/1M</b>`,
-        `💳 Biaya: <b>${formatCost(entry.cost)}</b>`,
+        `📥 Input: <b>${formatTokens(input)}</b>${entry.cachedInputTokens ? ` (cache ${formatTokens(entry.cachedInputTokens)})` : ''}  •  📤 Output: <b>${formatTokens(output)}</b>`,
+        `🔢 Total: <b>${formatTokens(total)}</b>${entry.estimated ? ' <i>(estimasi)</i>' : ''}`,
+        billing,
       ].join('\n');
     });
     const estimatedNote = logs.slice(-10).some((entry) => entry.estimated)
@@ -4006,6 +4691,15 @@ async function handleMessage(message) {
     account = await ensureUser(user.id || message.chat.id, profile);
   }
   const text = message.text.trim();
+  if (isAdmin(userId) && pendingAdminCredit.has(userId) && !text.startsWith('/')) {
+    try {
+      await handleAdminCreditInput(message.chat.id, userId, text);
+    } catch (error) {
+      pendingAdminCredit.delete(userId);
+      await telegram('sendMessage', { chat_id: message.chat.id, text: `\u{274C} Kredit: ${escapeHtml(error.message)}`, parse_mode: 'HTML', reply_markup: adminBackKeyboard() });
+    }
+    return;
+  }
   if (isAdmin(userId) && pendingAdminReferral.has(userId) && !text.startsWith('/')) {
     const field = pendingAdminReferral.get(userId);
     const value = parseTokenAmount(text);
@@ -4223,7 +4917,8 @@ const BOT_COMMANDS = [
   { command: 'start', id: 'Mulai bot / tampilkan menu utama', en: 'Start the bot / show the main menu' },
   { command: 'menu', id: 'Menu utama', en: 'Main menu' },
   { command: 'dashboard', id: 'API Dashboard: API key & pemakaian', en: 'API dashboard: keys & usage' },
-  { command: 'topup', id: 'Isi saldo', en: 'Top up your balance' },
+  { command: 'kredit', id: 'Kredit token: saldo, paket & multiplier', en: 'Token credits: balance, packages & multipliers' },
+  { command: 'topup', id: 'Beli kredit / isi saldo', en: 'Buy credits / top up' },
   { command: 'model', id: 'Daftar model & harga', en: 'Model list & prices' },
   { command: 'logs', id: 'Riwayat pemakaian API terbaru', en: 'Recent API usage' },
   { command: 'usage', id: 'Ringkasan pemakaian per model', en: 'Usage summary per model' },
@@ -4239,7 +4934,7 @@ const COMMAND_LANGUAGES = [
   { languageCode: '', text: 'en' },
 ];
 // Commands that do exactly what a main-menu button does: command -> that button's callback_data.
-const COMMAND_ACTIONS = new Map([['dashboard', 'dashboard'], ['topup', 'top_up'], ['logs', 'logs'], ['usage', 'usage'], ['referral', 'referral']]);
+const COMMAND_ACTIONS = new Map([['dashboard', 'dashboard'], ['kredit', 'credits'], ['credits', 'credits'], ['topup', 'top_up'], ['logs', 'logs'], ['usage', 'usage'], ['referral', 'referral']]);
 
 // "/topup" or "/topup@MyBot" -> "topup". Null for other text, and for a command meant for a
 // different bot (in a group).

@@ -31,6 +31,9 @@ const FUNCTION_NAMES = [
   'listBansos', 'createBansos', 'stopBansos',
   'getModerationSettings', 'setModerationSettings', 'listModerationBlocks', 'getModerationBlock', 'clearModerationBlocks',
   'saveModelCache',
+  // Token credits (credit-store.js / credit-config.js on the API server).
+  'getCreditOverview', 'getCreditOrder', 'createCreditOrder', 'markCreditOrderFailed', 'settlePayment', 'adminConfirmCreditOrder',
+  'adjustCredits', 'refundCredits', 'getCreditStats', 'listCreditOrders', 'getCreditCatalog', 'getCreditAdmin', 'updateCreditConfig',
 ];
 
 const remote = Boolean(DATA_API_URL);
@@ -103,11 +106,15 @@ function buildLocal() {
   const path = require('path');
   const usageDb = require('./usage-db');
   const adminSettings = require('./admin-settings');
+  const creditStore = require('./credit-store');
+  const creditConfig = require('./credit-config');
   const local = {
     ...usageDb,
     ...adminSettings,
+    ...creditStore,
+    ...creditConfig,
     saveModelCache: (cache) => {
-      const cachePath = path.join(__dirname, 'data', 'models.json');
+      const cachePath = usageDb.modelCachePath || path.join(__dirname, 'data', 'models.json');
       fs.mkdirSync(path.dirname(cachePath), { recursive: true });
       fs.writeFileSync(cachePath, JSON.stringify(cache, null, 2), 'utf8');
       return true;

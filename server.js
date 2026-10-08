@@ -13,6 +13,9 @@ const adminSettings = require('./admin-settings');
 const { PINNED_MODELS, getModelFamily, stripModelPrefix } = require('./pricing');
 const { isAllModelsFree } = require('./admin-settings');
 const moderation = require('./moderation');
+const creditRules = require('./credit-rules');
+const creditConfig = require('./credit-config');
+const creditStore = require('./credit-store');
 
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = Number(process.env.PORT || 8080);
@@ -20,7 +23,7 @@ const UPSTREAM_BASE_URL = process.env.UPSTREAM_BASE_URL || 'https://sg1-9682fffd
 // Support both the project-specific name and the name used by OpenAI clients.
 const API_KEY = process.env.UPSTREAM_API_KEY || process.env.OPENAI_API_KEY;
 const CASHI_SECRET_KEY = process.env.CASHI_SECRET_KEY;
-const modelCachePath = path.join(__dirname, 'data', 'models.json');
+const modelCachePath = usageDb.modelCachePath || path.join(__dirname, 'data', 'models.json');
 
 if (!UPSTREAM_BASE_URL) {
   console.error('UPSTREAM_BASE_URL is not set. Refusing to start.');
@@ -93,8 +96,13 @@ app.post('/webhooks/cashi', express.raw({ type: 'application/json' }), (req, res
   } catch (_) {
     return res.status(400).send('Invalid JSON');
   }
+  // Token credit / unlimited orders are credited once, only when the paid amount covers the
+  // order price (credit-store.js); every other order id is the old Rupiah top-up.
   if (event.event === 'PAYMENT_SETTLED' && event.data?.status === 'SETTLED') {
-    settleOrder(event.data.order_id, event.data.amount);
+    const result = creditStore.settlePayment(event.data.order_id, event.data.amount, event.data.status, { source: 'webhook' });
+    if (result && result.settled === false && result.reason) {
+      console.warn(`[cashi] order ${String(event.data.order_id).slice(0, 80)} not credited: ${result.reason}`);
+    }
   }
   return res.send('OK');
 });
@@ -176,6 +184,20 @@ const INTERNAL_FUNCTIONS = {
   listModerationBlocks: usageDb.listModerationBlocks,
   getModerationBlock: usageDb.getModerationBlock,
   clearModerationBlocks: usageDb.clearModerationBlocks,
+  // Token credits. Writes that change money or configuration check ADMIN_TELEGRAM_ID themselves.
+  getCreditOverview: creditStore.getCreditOverview,
+  getCreditOrder: creditStore.getCreditOrder,
+  createCreditOrder: creditStore.createCreditOrder,
+  markCreditOrderFailed: creditStore.markCreditOrderFailed,
+  settlePayment: creditStore.settlePayment,
+  adminConfirmCreditOrder: creditStore.adminConfirmCreditOrder,
+  adjustCredits: creditStore.adjustCredits,
+  refundCredits: creditStore.refundCredits,
+  getCreditStats: creditStore.getCreditStats,
+  listCreditOrders: creditStore.listCreditOrders,
+  getCreditCatalog: creditConfig.getCreditCatalog,
+  getCreditAdmin: creditConfig.getCreditAdmin,
+  updateCreditConfig: creditConfig.updateCreditConfig,
   // The bot syncs the model list; the proxy needs its aliases to route requests.
   saveModelCache: (cache) => {
     fs.mkdirSync(path.dirname(modelCachePath), { recursive: true });
@@ -340,6 +362,14 @@ function buildAdminStats() {
       announcementAt: settings.announcementAt || null,
     },
     topUsers,
+    // Token credits (separate from the Rupiah balance above).
+    credits: (() => {
+      try {
+        return creditStore.getCreditStats();
+      } catch (error) {
+        return { error: error.message };
+      }
+    })(),
   };
 }
 
@@ -470,7 +500,12 @@ app.use('/v1', (req, res, next) => {
       pricePerMillion: usage.pricePerMillion || 0,
       cost: usage.cost || 0,
       balanceAfter: usage.balanceAfter,
+      ...(req.billing?.funding ? { funding: req.billing.funding } : {}),
+      ...(usage.credits !== undefined ? { credits: usage.credits, multiplier: usage.multiplier } : {}),
+      ...(usage.estimated ? { estimated: true } : {}),
     };
+    // Written after the response, outside Express's error handling: a busy database is retried.
+    runDbWrite(`request log ${entry.method} ${entry.path}`, () => recordAdminRequest(entry));
   });
   next();
 });
@@ -494,7 +529,12 @@ app.use('/v1', (req, res, next) => {
       },
     });
   }
-  if (model && req.body) req.body.model = resolveUpstreamModel(model);
+  if (model && req.body) {
+    // Display name for pricing / credits, upstream route ("cbcn/glm-5.2") for the provider.
+    req.displayModel = stripModelPrefix(String(model)).trim().toLowerCase();
+    req.body.model = resolveUpstreamModel(model);
+    req.upstreamModel = String(req.body.model);
+  }
   next();
 });
 
@@ -535,6 +575,77 @@ function hasExclusiveAccess(req, model) {
   return Boolean(access && access.models.includes(stripModelPrefix(model).trim().toLowerCase()));
 }
 
+// ---------- Which balance pays for a request ----------
+// Decided once, before anything is forwarded, in this order:
+//   free       free mode or an active BANSOS window (unchanged behaviour, nothing is charged)
+//   unlimited  an active unlimited pass that covers this model: no credits are charged
+//   credits    token credits, when the model has a credit rate and the user has credits left
+//   legacy     the old Rupiah balance / referral bonus tokens with the old per-1M prices
+//              (kept separate from credits; can be switched off: billing legacy_rupiah off)
+// A model without a credit rate ("menunggu konfigurasi") is never paid with credits.
+function requestEffort(body) {
+  const value = body?.reasoning_effort ?? body?.reasoning?.effort ?? '';
+  return typeof value === 'string' ? value.trim().toLowerCase() : '';
+}
+
+function legacyFundsAvailable(user, config) {
+  if (config && !config.billing.legacyRupiahEnabled) return false;
+  const balance = Number(user.balance || 0);
+  return (Number.isFinite(balance) && balance > 0) || Number(user.bonusTokens || 0) > 0;
+}
+
+function decideFunding(req, user) {
+  if (isAllModelsFree()) return { funding: 'free', reason: 'free_mode' };
+  if (req.bansos) return { funding: 'free', reason: 'bansos' };
+  const model = req.displayModel || '';
+  let config = null;
+  let state = null;
+  try {
+    config = creditConfig.getCreditConfig();
+    state = creditStore.getUserBillingState(user.telegramId, model);
+  } catch (error) {
+    if (isDbBusy(error)) throw error;
+    console.error('[credits] unavailable, only the Rupiah balance is used:', error.message);
+    config = null;
+    state = null;
+  }
+  const legacy = legacyFundsAvailable(user, config);
+  const credits = state ? state.account.available : 0;
+  // Requests without a model (GET /v1/models, ...) are not billed; any balance lets them through.
+  if (!model) return legacy || credits > 0 || state?.hasActivePass ? { funding: 'none' } : { reject: 'no_funds' };
+  if (state?.pass) return { funding: 'unlimited', pass: state.pass };
+  if (config && credits > 0) {
+    const rate = creditRules.resolveRate(config, { model, provider: creditRules.providerOf(req.upstreamModel), effort: requestEffort(req.body) });
+    if (rate.ok) return { funding: 'credits', snapshot: rate.snapshot, limits: config.limits, legacyFallback: legacy };
+    if (legacy) return { funding: 'legacy', note: rate.reason };
+    return { reject: 'pending_rate', reason: rate.reason, hasPass: Boolean(state?.hasActivePass) };
+  }
+  if (legacy) return { funding: 'legacy' };
+  return { reject: 'no_funds', hasPass: Boolean(state?.hasActivePass) };
+}
+
+function rejectFunding(res, decision, model) {
+  if (decision.reject === 'pending_rate') {
+    return res.status(403).json({
+      error: {
+        message: `Model '${model}' cannot be used with token credits yet: ${decision.reason}. / Model ini belum bisa dipakai dengan kredit token (menunggu konfigurasi admin).`,
+        type: 'model_pending_configuration',
+        code: 'model_pending_configuration',
+      },
+    });
+  }
+  const outsidePass = decision.hasPass && model
+    ? ` Model '${model}' is not included in your unlimited package, so it needs token credits. / Model ini tidak termasuk paket unlimited kamu, jadi memakai kredit token.`
+    : '';
+  return res.status(402).json({
+    error: {
+      message: `Insufficient balance. Buy a token credit package (or top up) before using the API.${outsidePass}`,
+      type: 'insufficient_balance',
+      code: 'payment_required',
+    },
+  });
+}
+
 // Every API request must use an active generated user key.
 app.use('/v1', (req, res, next) => {
   const clientApiKey = getClientApiKey(req);
@@ -546,21 +657,12 @@ app.use('/v1', (req, res, next) => {
   req.userRecord = user;
   // Extra models from an active model access code (used by GET /v1/models). Never blocks anything.
   req.modelAccess = activeModelAccess(user);
-  const balance = Number(user.balance || 0);
-  // Referral bonus tokens also let a user call the API with a zero Rp balance.
-  const bonusTokens = Number(user.bonusTokens || 0);
   // A model under an active BANSOS is free, also for users with no balance left.
   // Decided once here, so a request that started inside the window stays free.
   req.bansos = bansosFor(req.body && req.body.model);
-  if (!isAllModelsFree() && !req.bansos && (!Number.isFinite(balance) || balance <= 0) && !(bonusTokens > 0)) {
-    return res.status(402).json({
-      error: {
-        message: 'Insufficient balance. Please top up your account before using the API.',
-        type: 'insufficient_balance',
-        code: 'payment_required',
-      },
-    });
-  }
+  const decision = decideFunding(req, user);
+  if (decision.reject) return rejectFunding(res, decision, req.displayModel);
+  req.billing = decision;
   next();
 });
 
@@ -898,29 +1000,22 @@ function estimateTokens(text) {
   return Math.ceil((value.length - wide) / 4) + wide;
 }
 
-// { input, output } from one usage object (OpenAI or Anthropic field names), or null.
-function usageCounts(usage) {
-  if (!usage || typeof usage !== 'object') return null;
-  const input = Number(usage.prompt_tokens ?? usage.input_tokens);
-  const output = Number(usage.completion_tokens ?? usage.output_tokens);
-  if (!Number.isFinite(input) && !Number.isFinite(output)) return null;
-  return { input: Number.isFinite(input) ? input : 0, output: Number.isFinite(output) ? output : 0 };
-}
-
-// Reads a whole response (JSON or SSE). Counts are cumulative in every format we know, so the
-// highest value of each field wins: that also joins Anthropic's input (message_start) and output
-// (message_delta) counts. { found, inputTokens, outputTokens, model, outputText }.
+// Reads a whole response (JSON or SSE). Every usage object is normalised by credit-rules.js
+// (OpenAI, Responses API, DeepSeek, Anthropic incl. cache tokens, Gemini usageMetadata;
+// reasoning and cached tokens counted exactly once). Counts are cumulative in every format we
+// know, so the highest value of each field wins: that also joins Anthropic's input
+// (message_start) and output (message_delta) counts.
+// { found, counts, inputTokens, outputTokens, model, outputText }.
 function readUsage(text) {
-  const result = { found: false, inputTokens: 0, outputTokens: 0, model: '', outputText: '' };
+  const result = { found: false, counts: null, inputTokens: 0, outputTokens: 0, model: '', outputText: '' };
   const pieces = [];
   const take = (event) => {
     if (!event || typeof event !== 'object') return;
-    for (const usage of [event.usage, event.response?.usage, event.message?.usage]) {
-      const counts = usageCounts(usage);
+    for (const usage of [event.usage, event.response?.usage, event.message?.usage, event.usageMetadata]) {
+      const counts = creditRules.normalizeUsage(usage);
       if (!counts) continue;
       result.found = true;
-      result.inputTokens = Math.max(result.inputTokens, counts.input);
-      result.outputTokens = Math.max(result.outputTokens, counts.output);
+      result.counts = creditRules.mergeUsage(result.counts, counts);
     }
     const model = event.model || event.response?.model || event.message?.model;
     if (typeof model === 'string' && model) result.model = model;
@@ -945,8 +1040,277 @@ function readUsage(text) {
       } catch (_) { /* Ignore non-JSON keep-alive chunks. */ }
     }
   }
+  result.inputTokens = result.counts?.inputTokens || 0;
+  result.outputTokens = result.counts?.outputTokens || 0;
   result.outputText = pieces.join('');
   return result;
+}
+
+// ---------- Token credits: reservation before, settlement after ----------
+// Before a credit-paid request is forwarded, credits are reserved atomically (credit-store.js)
+// for the estimated input (text length, plus inputSafetyPercent) and the output limit. When the
+// balance cannot pay for the requested output, the output limit is lowered to what it can pay
+// for (header X-Credit-Output-Limit); when it cannot pay for even minOutputTokens the request is
+// refused with 402. After the response the reservation is settled ONCE with the usage the
+// upstream reported, at the rate snapshot taken at the start, and the rest is released.
+// Policy when usage is missing (README "Kredit token"): a successful response without usage, or
+// a stream that was cut off, is billed from the text (about 4 characters per token, never 0 for
+// a real generation) and marked estimated; an upstream error without usage, or an upstream that
+// never answered, costs nothing; a client that hung up before the upstream answered pays the
+// input estimate (the prompt was already sent upstream).
+function outputLimitField(urlPath, body, limits) {
+  if (/\/responses\/?$/.test(urlPath)) return 'max_output_tokens';
+  if (/\/messages\/?$/.test(urlPath)) return 'max_tokens';
+  if (body.max_completion_tokens !== undefined && body.max_completion_tokens !== null) return 'max_completion_tokens';
+  if (body.max_tokens !== undefined && body.max_tokens !== null) return 'max_tokens';
+  return /\/chat\/completions\/?$/.test(urlPath) ? limits.chatMaxTokensField : 'max_tokens';
+}
+
+function clientOutputLimit(body, field) {
+  const value = Number(body?.[field]);
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+function reserveForRequest(req, res, plan) {
+  const { snapshot, limits } = plan;
+  const urlPath = requestPath(req);
+  const generation = req.method === 'POST' && GENERATION_PATH.test(urlPath) && req.body && typeof req.body === 'object';
+  const rawInput = estimateTokens(requestTextForEstimate(req.body));
+  const inputEstimate = Math.ceil((rawInput * (100 + limits.inputSafetyPercent)) / 100);
+  const field = generation ? outputLimitField(urlPath, req.body, limits) : null;
+  const requested = field ? clientOutputLimit(req.body, field) : null;
+  const toolReserve = snapshot.toolCallCredits ? snapshot.toolCallCredits * limits.toolCallReserve : 0;
+  const result = creditStore.reserveCredits(req.userRecord.telegramId, (available) => {
+    const minOutput = generation ? Math.min(limits.minOutputTokens, requested || limits.minOutputTokens) : 0;
+    const minimum = creditRules.computeCredits(snapshot.units, { inputTokens: inputEstimate, outputTokens: minOutput }) + toolReserve;
+    if (available < minimum) return { reject: true, needed: minimum };
+    const inputCost = creditRules.computeCredits(snapshot.units, { inputTokens: inputEstimate });
+    const affordable = generation ? creditRules.affordableOutputTokens(snapshot.units, available - inputCost - toolReserve) : 0;
+    const wanted = generation ? (requested || limits.defaultReserveOutputTokens) : 0;
+    const reserveOutput = Math.max(0, Math.min(wanted, affordable));
+    let setLimit = null;
+    if (generation && ((requested && requested > affordable) || (!requested && affordable < limits.defaultReserveOutputTokens))) setLimit = reserveOutput;
+    return {
+      credits: creditRules.computeCredits(snapshot.units, { inputTokens: inputEstimate, outputTokens: reserveOutput }) + toolReserve,
+      setLimit,
+      estimate: { inputTokens: rawInput, inputReserved: inputEstimate, outputReserved: reserveOutput },
+    };
+  }, { snapshot, endpoint: urlPath });
+  if (!result.ok) return result;
+  if (result.plan.setLimit !== null && field && result.plan.setLimit > 0) {
+    req.body[field] = result.plan.setLimit;
+    res.setHeader('X-Credit-Output-Limit', String(result.plan.setLimit));
+  }
+  req.creditReservation = result.reservation;
+  req.creditInputEstimate = rawInput;
+  res.setHeader('X-Billing-Funding', 'credits');
+  res.setHeader('X-Credit-Multiplier', snapshot.multiplier);
+  res.setHeader('X-Credit-Reserved', String(result.reservation.credits));
+  return result;
+}
+
+// Unlimited pass limits, per user, in memory (like the RPM limits; reset on restart).
+const unlimitedInFlight = new Map(); // telegramId -> running requests
+const unlimitedHits = new Map(); // telegramId -> request timestamps (ms)
+setInterval(() => {
+  const cutoff = Date.now() - RATE_WINDOW_MS;
+  for (const [id, hits] of unlimitedHits) if (!hits.length || hits[hits.length - 1] <= cutoff) unlimitedHits.delete(id);
+}, 5 * 60_000).unref();
+
+function enforceUnlimited(req, res, pass) {
+  const id = String(req.userRecord.telegramId);
+  const limits = pass.limits || {};
+  const now = Date.now();
+  const hits = (unlimitedHits.get(id) || []).filter((time) => now - time < RATE_WINDOW_MS);
+  if (limits.rpm && hits.length >= limits.rpm) {
+    const retryAfter = Math.max(1, Math.ceil((hits[0] + RATE_WINDOW_MS - now) / 1000));
+    res.set('Retry-After', String(retryAfter));
+    res.status(429).json({ error: { message: `Unlimited package limit: ${limits.rpm} requests per minute. Try again in ${retryAfter}s. / Batas paket unlimited tercapai.`, type: 'unlimited_rate_limit', code: 'rate_limit_exceeded' } });
+    return false;
+  }
+  const running = unlimitedInFlight.get(id) || 0;
+  if (limits.maxConcurrent && running >= limits.maxConcurrent) {
+    res.set('Retry-After', '5');
+    res.status(429).json({ error: { message: `Unlimited package limit: at most ${limits.maxConcurrent} requests at the same time. / Batas request bersamaan paket unlimited tercapai.`, type: 'unlimited_concurrency_limit', code: 'rate_limit_exceeded' } });
+    return false;
+  }
+  hits.push(now);
+  unlimitedHits.set(id, hits);
+  unlimitedInFlight.set(id, running + 1);
+  res.once('close', () => {
+    const left = (unlimitedInFlight.get(id) || 1) - 1;
+    if (left > 0) unlimitedInFlight.set(id, left);
+    else unlimitedInFlight.delete(id);
+  });
+  const urlPath = requestPath(req);
+  if (limits.maxOutputTokens && req.method === 'POST' && GENERATION_PATH.test(urlPath) && req.body && typeof req.body === 'object') {
+    const field = outputLimitField(urlPath, req.body, creditConfig.getCreditConfig().limits);
+    const current = clientOutputLimit(req.body, field);
+    if (!current || current > limits.maxOutputTokens) {
+      req.body[field] = limits.maxOutputTokens;
+      res.setHeader('X-Unlimited-Output-Limit', String(limits.maxOutputTokens));
+    }
+  }
+  res.setHeader('X-Billing-Funding', 'unlimited');
+  return true;
+}
+
+app.use('/v1', (req, res, next) => {
+  const plan = req.billing;
+  if (!plan || !req.userRecord) return next();
+  if (plan.funding === 'unlimited') return enforceUnlimited(req, res, plan.pass) ? next() : undefined;
+  if (plan.funding !== 'credits') return next();
+  const reserved = reserveForRequest(req, res, plan);
+  if (reserved.ok) {
+    // Safety net: a request that never reached the upstream gives its reservation back.
+    res.once('close', () => {
+      if (!req.creditForwarded) finalizeWithoutResponse(req, 'not_forwarded');
+    });
+    return next();
+  }
+  if (plan.legacyFallback) {
+    req.billing = { funding: 'legacy', note: 'credits_insufficient' };
+    return next();
+  }
+  return res.status(402).json({
+    error: {
+      message: `Insufficient token credits for '${req.displayModel}' (x${plan.snapshot.multiplier}): ${reserved.available} credits available, this request needs at least ${reserved.needed}. / Kredit token tidak cukup untuk request ini; beli paket kredit di bot.`,
+      type: 'insufficient_credits',
+      code: 'payment_required',
+      available_credits: reserved.available,
+      required_credits: reserved.needed,
+      multiplier: plan.snapshot.multiplier,
+    },
+  });
+});
+
+const EMPTY_COUNTS = Object.freeze({ inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningTokens: 0, toolCalls: 0 });
+
+function inputEstimateOf(req) {
+  if (req.creditInputEstimate === undefined) req.creditInputEstimate = estimateTokens(requestTextForEstimate(req.body));
+  return req.creditInputEstimate;
+}
+
+// The upstream never sent a response (connection error, timeout) or the client hung up first.
+function finalizeWithoutResponse(req, reason) {
+  if (req.billingFinalized || req.upstreamResponded) return;
+  req.billingFinalized = true;
+  const reservation = req.creditReservation;
+  if (!reservation) return;
+  const clientGone = reason === 'client_aborted' && req.creditForwarded;
+  if (clientGone) {
+    runDbWrite(`credit settle ${reservation.id}`, () => creditStore.settleReservation(reservation.id, {
+      counts: { inputTokens: inputEstimateOf(req) }, estimated: true, status: 499, reason: 'client_aborted_before_response',
+    }));
+  } else {
+    runDbWrite(`credit release ${reservation.id}`, () => creditStore.releaseReservation(reservation.id, reason));
+  }
+}
+
+// Usage of one finished (or cut off) upstream response, billed to whatever pays for the request.
+function finalizeUsage(req, proxyRes, chunks, complete) {
+  if (req.billingFinalized) return;
+  req.billingFinalized = true;
+  let parsed = { found: false, counts: null, model: '', outputText: '' };
+  let readable = true;
+  try {
+    parsed = readUsage(responseText(Buffer.concat(chunks), proxyRes.headers['content-encoding']));
+  } catch (error) {
+    // Undecodable bodies are still counted as requests (and estimated below when successful).
+    readable = false;
+    console.error(`[billing] could not read the response of ${req.originalUrl}: ${error.message}`);
+  }
+  const status = proxyRes.statusCode;
+  const plan = req.billing || { funding: 'legacy' };
+  const reported = parsed.found ? parsed.counts : null;
+  const hasTokens = Boolean(reported && reported.inputTokens + reported.outputTokens > 0);
+  const generation = req.method === 'POST' && GENERATION_PATH.test(requestPath(req));
+  const billable = status < 400 && (generation || Boolean(req.creditReservation));
+  let counts = reported ? { ...reported } : { ...EMPTY_COUNTS };
+  let estimated = false;
+  if (billable && !hasTokens) {
+    // A successful generation without any reported tokens would otherwise be free.
+    counts = { ...EMPTY_COUNTS, inputTokens: inputEstimateOf(req), outputTokens: estimateTokens(parsed.outputText) };
+    estimated = true;
+  } else if (billable && !complete) {
+    // Cut off: what was reported may predate the cut (Anthropic reports output 1 at the start).
+    const seenOutput = estimateTokens(parsed.outputText);
+    if (seenOutput > counts.outputTokens) {
+      counts.outputTokens = seenOutput;
+      estimated = true;
+    }
+    if (!counts.inputTokens) {
+      counts.inputTokens = inputEstimateOf(req);
+      estimated = true;
+    }
+  }
+  const partial = !complete;
+  const billingModel = parsed.model || req.requestModel;
+  if (estimated) {
+    console.warn(`[billing] ${partial ? 'response cut off' : 'no usage from upstream'} for ${req.originalUrl} (${billingModel}, user ${req.userRecord?.telegramId || '-'}${readable ? '' : ', unreadable body'}): billed an estimate of ${counts.inputTokens} + ${counts.outputTokens} tokens`);
+  }
+  const totalTokens = counts.inputTokens + counts.outputTokens;
+  req.usageDetails = { inputTokens: counts.inputTokens, outputTokens: counts.outputTokens, totalTokens, pricePerMillion: 0, cost: 0, ...(estimated ? { estimated: true } : {}) };
+  const base = {
+    endpoint: req.originalUrl,
+    statusCode: status,
+    inputTokens: counts.inputTokens,
+    outputTokens: counts.outputTokens,
+    ...(estimated ? { estimated: true } : {}),
+  };
+  const logUsage = (extra) => runDbWrite(`usage log user ${req.userRecord?.telegramId || '-'}`, () => recordUsage(req.userApiKey, { ...base, ...extra }));
+
+  if (plan.funding === 'credits' && req.creditReservation) {
+    const reservation = req.creditReservation;
+    if (status >= 400 && !hasTokens) {
+      // Failed before any usage: nothing is charged, the whole reservation is released.
+      runDbWrite(`credit release ${reservation.id}`, () => creditStore.releaseReservation(reservation.id, `upstream status ${status}`));
+      req.usageDetails.credits = 0;
+      req.usageDetails.multiplier = reservation.snapshot.multiplier;
+      logUsage({ model: req.requestModel, pricePerMillion: 0, funding: 'credits', credits: 0, multiplier: reservation.snapshot.multiplier, rateModel: reservation.snapshot.rateModel });
+      return;
+    }
+    runDbWrite(`credit settle ${reservation.id}`, () => creditStore.settleReservation(reservation.id, {
+      counts, estimated, partial, status, upstreamModel: parsed.model,
+    }), (settled) => {
+      if (!settled || !settled.ok) return;
+      req.usageDetails.credits = settled.charged;
+      req.usageDetails.multiplier = settled.multiplier;
+      if (settled.shortfall) console.warn(`[credits] user ${reservation.userId}: ${settled.shortfall} credits could not be collected (balance exhausted) on ${reservation.id}`);
+      logUsage({
+        model: req.requestModel,
+        pricePerMillion: 0,
+        funding: 'credits',
+        credits: settled.charged,
+        multiplier: settled.multiplier,
+        rateModel: settled.rateModel,
+        cachedInputTokens: counts.cachedInputTokens,
+        partial,
+        shortfall: settled.shortfall,
+      });
+    });
+    return;
+  }
+  if (plan.funding === 'unlimited' || plan.funding === 'free') {
+    logUsage({ model: billingModel, pricePerMillion: 0, funding: plan.funding });
+    return;
+  }
+  // Old Rupiah balance (and requests without a model). BANSOS requests cost Rp0.
+  const pricePerMillion = req.bansos ? 0 : require('./pricing').getBillingPrice(billingModel);
+  const cost = pricePerMillion ? (totalTokens / 1_000_000) * pricePerMillion : 0;
+  Object.assign(req.usageDetails, { pricePerMillion, cost });
+  runDbWrite(`usage billing user ${req.userRecord?.telegramId || '-'}`, () => recordUsage(req.userApiKey, {
+    ...base,
+    model: billingModel,
+    ...(req.bansos ? { pricePerMillion: 0 } : {}),
+    ...(plan.funding === 'legacy' ? { funding: 'legacy' } : {}),
+  }), (recorded) => {
+    // Bonus tokens may have covered part of the bill: log what was really charged.
+    if (recorded && typeof recorded === 'object') {
+      req.usageDetails.cost = recorded.cost;
+      req.usageDetails.balanceAfter = recorded.balance;
+    }
+  });
 }
 
 // OpenAI-compatible endpoint:
@@ -980,55 +1344,38 @@ app.use(
         if (req.body && ['POST', 'PUT', 'PATCH'].includes(req.method)) {
           fixRequestBody(proxyReq, req);
         }
+        req.creditForwarded = true;
+        proxyReq.once('response', () => {
+          req.upstreamResponded = true;
+        });
+        // Closed without any response: an upstream failure, or the client hung up first.
+        proxyReq.once('close', () => {
+          if (!req.upstreamResponded) finalizeWithoutResponse(req, req.socket?.destroyed ? 'client_aborted' : 'connection_closed');
+        });
 
         console.log(`[proxy] ${req.method} ${req.originalUrl} -> ${UPSTREAM_BASE_URL}${req.url}`);
       },
-      proxyRes: (proxyRes, req) => {
+      proxyRes: (proxyRes, req, res) => {
+        req.upstreamResponded = true;
         if (!req.userApiKey) return;
         const chunks = [];
+        let ended = false;
         proxyRes.on('data', (chunk) => chunks.push(chunk));
-        proxyRes.on('end', () => {
-          let parsed = { found: false, inputTokens: 0, outputTokens: 0, model: '', outputText: '' };
-          let readable = true;
-          try {
-            parsed = readUsage(responseText(Buffer.concat(chunks), proxyRes.headers['content-encoding']));
-          } catch (error) {
-            // Undecodable bodies are still counted as requests (and estimated below when successful).
-            readable = false;
-            console.error(`[billing] could not read the response of ${req.originalUrl}: ${error.message}`);
-          }
-          let inputTokens = parsed.inputTokens;
-          let outputTokens = parsed.outputTokens;
-          const billingModel = parsed.model || req.requestModel;
-          // A successful generation without any reported tokens would otherwise be free.
-          const estimated = proxyRes.statusCode < 400 && req.method === 'POST' && GENERATION_PATH.test(requestPath(req))
-            && !(parsed.found && inputTokens + outputTokens > 0);
-          if (estimated) {
-            inputTokens = estimateTokens(requestTextForEstimate(req.body));
-            outputTokens = estimateTokens(parsed.outputText);
-            console.warn(`[billing] no usage from upstream for ${req.originalUrl} (${billingModel}, user ${req.userRecord?.telegramId || '-'}${readable ? '' : ', unreadable body'}): billed an estimate of ${inputTokens} + ${outputTokens} tokens`);
-          }
-          // BANSOS requests cost Rp0, so neither the balance nor bonus tokens are used.
-          const pricePerMillion = req.bansos ? 0 : require('./pricing').getBillingPrice(billingModel);
-          const totalTokens = Number(inputTokens) + Number(outputTokens);
-          const cost = pricePerMillion ? (totalTokens / 1_000_000) * pricePerMillion : 0;
-          req.usageDetails = { inputTokens, outputTokens, totalTokens, pricePerMillion, cost };
-          const recorded = recordUsage(req.userApiKey, {
-            endpoint: req.originalUrl,
-            statusCode: proxyRes.statusCode,
-            model: billingModel,
-            inputTokens,
-            outputTokens,
-            ...(req.bansos ? { pricePerMillion: 0 } : {}),
-          });
-          // Bonus tokens may have covered part of the bill: log what was really charged.
-          if (recorded && typeof recorded === 'object') req.usageDetails.cost = recorded.cost;
-          const updatedUser = require('./usage-db').findUserByApiKey(req.userApiKey);
-          req.usageDetails.balanceAfter = updatedUser?.balance;
+        proxyRes.once('end', () => {
+          ended = true;
+          finalizeUsage(req, proxyRes, chunks, true);
+        });
+        // A stream cut off midway ('close' without 'end'): bill what really happened, and close the
+        // client's connection too (the pipe would otherwise leave it waiting for more data forever).
+        proxyRes.once('close', () => {
+          if (ended) return;
+          finalizeUsage(req, proxyRes, chunks, false);
+          if (res && !res.writableEnded && !res.destroyed) res.destroy();
         });
       },
       error: (err, req, res) => {
         console.error('[proxy] error:', err.message);
+        finalizeWithoutResponse(req, 'upstream_error');
         if (res && !res.headersSent) {
           res.writeHead(502, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({
@@ -1065,6 +1412,22 @@ app.listen(PORT, HOST, () => {
     .map((entry) => `http://${entry.address}:${PORT}`);
   if (internal.length) console.log(`[internal] Bot DATA_API_URL candidates: ${internal.join(' , ')}`);
   const missing = Object.keys(INTERNAL_FUNCTIONS).filter((name) => typeof INTERNAL_FUNCTIONS[name] !== 'function');
-  if (missing.length) console.error(`[internal] Outdated files: missing ${missing.join(', ')}. Upload the latest usage-db.js and admin-settings.js.`);
+  if (missing.length) console.error(`[internal] Outdated files: missing ${missing.join(', ')}. Upload the latest usage-db.js, admin-settings.js, credit-rules.js, credit-config.js and credit-store.js.`);
   console.log(`Forwarding /v1/* -> ${UPSTREAM_BASE_URL}/*`);
+  // Credit reservations left behind by a previous process (crash / restart) or older than the TTL.
+  const sweepCredits = () => {
+    try {
+      creditStore.sweepReservations();
+    } catch (error) {
+      console.error('[credits] reservation sweep failed:', error.message);
+    }
+  };
+  sweepCredits();
+  setInterval(sweepCredits, 10 * 60_000).unref();
+  try {
+    const credits = creditConfig.getCreditConfig();
+    console.log(`[credits] token credits ready: config v${credits.version}, ${credits.packages.filter((item) => item.active).length} package(s) on sale, state ${path.basename(creditStore.statePath)}`);
+  } catch (error) {
+    console.error('[credits] configuration problem:', error.message);
+  }
 });

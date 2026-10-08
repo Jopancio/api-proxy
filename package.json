@@ -7,7 +7,9 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "bot": "node telegram-bot.js"
+    "bot": "node telegram-bot.js",
+    "test": "node --test \"test/*.test.js\"",
+    "migrate:credits": "node scripts/migrate-credits.js"
   },
   "dependencies": {
     "express": "4.21.2",

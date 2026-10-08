@@ -134,6 +134,129 @@ Paid model prices include a default 25% markup, rounded to the nearest Rp50.
 Change `MODEL_PRICE_MARKUP` in `.env` to adjust the profit markup. Free models
 remain free.
 
+## Kredit token
+
+Pengguna membeli **kredit token** (menu **Kredit Token** / **Top up**, perintah `/kredit`).
+Kredit terpakai = (token input + token output yang ditagihkan) × multiplier model,
+dihitung dengan fixed-point (4 desimal) dan dibulatkan ke atas satu kredit sekali di akhir.
+Tidak ada minimum per request dan kredit tidak kedaluwarsa. 1 kredit = 1 token di model ×1;
+token aktual = kredit ÷ multiplier. Multiplier adalah tarif jual toko, bukan harga resmi provider.
+
+Paket default: 10 jt kredit Rp4.000, 25 jt Rp8.000, 50 jt Rp15.000, 100 jt Rp28.000.
+Default paket dan multiplier ada di `credit-rules.js`; perubahan admin disimpan sebagai
+override di `data/credit-config.json` (berversi, tercatat di audit).
+
+File data (di samping `users.json`, saldo Rupiah lama tidak disentuh):
+
+| File | Isi |
+| --- | --- |
+| `data/credits.json` | saldo kredit, reservasi berjalan, order kredit/unlimited, paket unlimited, riwayat singkat |
+| `data/credits-ledger.jsonl` | ledger lengkap (append-only): `purchase`, `usage`, `refund`, `adjustment`, `unlimited_purchase` |
+| `data/credit-config.json` | override admin + audit (dibuat saat perubahan pertama) |
+
+### Siapa yang membayar sebuah request
+
+Diputuskan sekali sebelum request diteruskan, berurutan:
+
+1. **Free mode / BANSOS** aktif: gratis (perilaku lama).
+2. **Paket unlimited** aktif yang mencakup model itu: tidak memotong kredit.
+3. **Kredit token**: bila model punya tarif dan kredit tersedia > 0.
+4. **Saldo Rupiah lama / bonus token referral** dengan harga per 1M lama (`billing legacy_rupiah on`).
+
+Model tanpa tarif (`glm-5v-turbo`, `kimi-k3-1`, model baru dari upstream) dan alias yang belum
+dipetakan (`claude`, `gemini-3.8-flash`, `gemini-3-flash-agent`, `gemini-pro-agent`) berstatus
+**menunggu konfigurasi**: ditolak 403 `model_pending_configuration` untuk pembayaran kredit.
+Tidak ada multiplier 0 (ditolak) dan tidak ada tebakan dari nama model.
+
+### Reservasi, pemotongan, streaming
+
+- Sebelum request: tarif di-snapshot (model, provider, routing, multiplier, versi config), lalu
+  kredit direservasi atomik untuk estimasi input (panjang teks ÷4, +`input_buffer`%) dan batas
+  output (`max_tokens`/`max_completion_tokens`/`max_output_tokens`, atau `output_default`).
+  Bila saldo tidak cukup untuk batas output itu, batasnya diturunkan (header `X-Credit-Output-Limit`);
+  bila tidak cukup untuk `output_min` token, request ditolak 402 `insufficient_credits`.
+- Setelah respons: reservasi dipotong **sekali** dengan usage upstream memakai snapshot tadi,
+  sisanya dilepas. Pemotongan tidak pernah melebihi kredit yang masih bebas, jadi saldo tidak
+  pernah negatif; kekurangan (bila usage jauh di atas reservasi) dicatat sebagai `shortfall`.
+- Usage dibaca dari OpenAI chat/completions, Responses API, DeepSeek, Anthropic (cache token
+  dijumlahkan sekali), Gemini `usageMetadata`. Token reasoning dan cached token tidak dihitung
+  dua kali. Tarif terpisah input/cache/output bisa diatur; defaultnya multiplier dasar.
+- Streaming: proxy meminta `stream_options.include_usage` dan memakai usage akhir.
+
+Kebijakan bila usage tidak ada:
+
+| Kejadian | Ditagih |
+| --- | --- |
+| Respons sukses tanpa usage | estimasi dari teks (input + output), ditandai `estimated` |
+| Stream terputus di tengah | usage yang sempat dilaporkan, minimal estimasi teks yang sudah keluar; ditandai `partial` + `estimated` |
+| Upstream error (status ≥ 400) tanpa usage, upstream tidak menjawab | 0 (reservasi dilepas) |
+| Klien menutup koneksi dan upstream tidak pernah menjawab | estimasi input (prompt sudah terkirim), `estimated`. Bila upstream tetap menjawab, usage aslinya yang dipakai |
+| Reservasi yatim (server mati/restart, atau lebih tua dari `ttl`) | estimasi input (`orphan charge`) atau dilepas (`batas orphan release`) |
+
+### Pembayaran
+
+Order kredit/unlimited dibuat di server lebih dulu (harga dan isi dari konfigurasi server), baru
+Cashi diminta QR dengan jumlah itu. Kredit ditambahkan hanya bila webhook Cashi yang ditandatangani
+(atau Refresh status yang mengecek Cashi) menyatakan `SETTLED` untuk order itu dengan jumlah ≥ harga.
+Webhook berulang tidak menambah kredit lagi. Bila jumlah tidak dikirim/kurang, order tetap pending;
+admin bisa memeriksa lalu `order <id> konfirmasi`. Order top up Rupiah lama (`TG-...`) tetap seperti dulu
+(kini jumlah yang dilaporkan lebih kecil dari order juga ditolak).
+
+### Paket unlimited
+
+Durasi 1/3/6/12/24 jam, harga awal kosong dan **tidak dijual** sampai admin menetapkan harga,
+mengaktifkan durasi, mengisi daftar model, lalu `unlimited jual on`. Batas per user: request
+bersamaan, request/menit, output maksimal. Model, batas dan harga disalin ke paket saat dibeli.
+Membeli lagi saat aktif = paket baru mulai setelah paket sekarang berakhir.
+
+### Perintah admin
+
+Admin Panel → **Kredit & Paket** → **Ketik perintah** (boleh beberapa baris sekaligus). Semua
+perintah diperiksa di server terhadap `ADMIN_TELEGRAM_ID` dan dicatat (Audit / ledger).
+
+```text
+paket kredit-10m 10000000 4000          paket kredit-10m off
+tarif glm-5v-turbo 1.5                  tarif kimi-k3-1 pending
+tarif glm-5.2 cache 0.5                 (tarif terpisah input | cache | output)
+alias claude claude-sonnet-4-6          effort gemini-3.8-flash high gemini-3.8-flash-high
+alias gemini-pro-agent gemini-3.1-pro-low
+tool gemini-pro-agent 2000              (kredit per tool call provider)
+route cbcn deepseek-v4-flash deepseek-v4.1-flash
+route cbcn deepseek-v4-flash -          (hapus aturan routing)
+batas output_default 8192               billing legacy_rupiah off
+unlimited harga 1 5000                  unlimited 1 on
+unlimited model tambah glm-5.1 kimi-k2.6
+unlimited batas rpm 20                  unlimited jual on
+kredit 123456789 +10000000 bonus        refund 123456789 25000 request gagal
+order KR-123456789-1700000000000-ABC123 konfirmasi
+```
+
+**Routing DeepSeek**: `deepseek-v4-flash` dan `deepseek-v4-pro` adalah alias bergulir, `-0731`,
+`-0813` dan `deepseek-v4.1-flash` checkpoint asli. Bila suatu provider (awalan route di
+`data/models.json`, mis. `cbcn`) mengarahkan alias ke V4.1-Flash, catat dengan `route` untuk
+provider itu saja: tarif ×1,5 dipakai hanya di sana. Provider lain tetap memakai tarif aslinya.
+
+### Migrasi dan rollback
+
+Migrasi tidak mengubah `users.json` dan tidak mengonversi Rupiah ke kredit.
+
+```powershell
+node scripts/migrate-credits.js          # dry run: hanya laporan
+node scripts/migrate-credits.js --apply  # backup ke data/backups/pre-credits-<waktu>/, lalu buat data/credits.json
+```
+
+Upload ke host: `credit-rules.js`, `credit-config.js`, `credit-store.js`, `server.js`, `usage-db.js`,
+`data-client.js`, `telegram-bot.js`, `scripts/migrate-credits.js`. Pada hosting terpisah, host bot
+butuh `credit-rules.js` (dan semua file kredit bila bot memakai data lokal). Jalankan migrasi di host `server.js`, lalu restart `server.js`
+dan `telegram-bot.js`. Kredit baru aktif bila Free Mode OFF dan Payments OPEN.
+
+Rollback: hentikan kedua service, kembalikan file kode versi sebelumnya (git), restart. Saldo Rupiah
+tetap utuh karena tidak pernah diubah. Simpan `data/credits.json`, `data/credits-ledger.jsonl` dan
+`data/credit-config.json` (jangan dihapus): kredit yang sudah dibeli tercatat di sana dan bisa
+dipulihkan dengan memasang kode baru lagi. Isi `data/backups/pre-credits-*` adalah salinan sebelum migrasi.
+
+Tes otomatis (mock upstream dan mock Cashi, folder data sementara): `npm test`.
+
 ## Test
 
 ```powershell
