@@ -66,6 +66,9 @@ const STEPS = [
   () => ({ callback_query: press(USER, 'dashboard') }),
   () => ({ message: message(USER, '/kredit') }),
   () => ({ callback_query: press(USER, 'cr_models') }),
+  () => ({ callback_query: press(ADMIN, 'admin_payments_toggle') }),
+  () => ({ callback_query: press(USER, 'top_up') }),
+  () => ({ callback_query: press(ADMIN, 'top_up') }),
 ];
 
 function finish(error) {

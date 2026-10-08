@@ -36,7 +36,10 @@ const CASHI_API_KEY = process.env.CASHI_API_KEY;
 const CASHI_API_URL = 'https://cashi.id/api/create-order';
 const ADMIN_TELEGRAM_ID = String(process.env.ADMIN_TELEGRAM_ID || '6957236291').trim();
 const STORE_NAME = process.env.STORE_NAME || 'X Store';
-const PAYMENTS_OFF_MESSAGE = '\u{1F6A7} <b>Top up sedang ditutup sementara.</b>\n\nPembayaran belum bisa dilakukan saat ini. Silakan coba lagi nanti, atau gunakan <b>Redeem Code</b> kalau kamu punya kode. \u{1F39F}\u{FE0F}';
+const PAYMENTS_OFF_MESSAGE = '\u{1F6A7} <b>Pembelian paket token sedang ditutup sementara.</b>\n\nPembayaran belum bisa dilakukan saat ini. Silakan coba lagi nanti, atau gunakan <b>Redeem Code</b> kalau kamu punya kode. \u{1F39F}\u{FE0F}';
+const PAYMENTS_OFF_ADMIN_HINT = '\n\n<i>Admin: buka lewat Admin Panel \u{2192} \u{1F513} Enable Payments.</i>';
+// One label for every entry point to the credit packages (menu, dashboard, Kredit Token screen).
+const BUY_CREDITS_BUTTON = '\u{1F6D2} Beli Paket Token';
 const pendingAdminActions = new Set();
 const pendingAdminTopups = new Map();
 // Admin redeem-code wizard: { step: 'amount' } or { step: 'uses', amount }.
@@ -215,7 +218,7 @@ function card(title, lines) {
 
 function menuKeyboard(userId = '') {
   const rows = [
-    [{ text: '\u{1F48E} Kredit Token', callback_data: 'credits' }, { text: '\u{1F4B3} Top up', callback_data: 'top_up' }],
+    [{ text: '\u{1F48E} Kredit Token', callback_data: 'credits' }, { text: BUY_CREDITS_BUTTON, callback_data: 'top_up' }],
     [{ text: '\u{1F4CA} API Dashboard', callback_data: 'dashboard' }, { text: '\u{1F9FE} Logs', callback_data: 'logs' }],
     [{ text: '\u{1F39F}\u{FE0F} Redeem Code', callback_data: 'redeem' }, { text: '\u{1F91D} Referral', callback_data: 'referral' }],
     [{ text: '\u{1F3AB} Create a Ticket', callback_data: 'ticket' }],
@@ -226,9 +229,9 @@ function menuKeyboard(userId = '') {
 
 function dashboardKeyboard() {
   return { inline_keyboard: [
-    [{ text: '\u{1F48E} Kredit Token', callback_data: 'credits' }, { text: '\u{1F4CB} Model & Multiplier', callback_data: 'cr_models' }],
-    [{ text: '\u{1F9FE} Logs', callback_data: 'logs' }, { text: '\u{1F4C8} Usage Summary', callback_data: 'usage' }],
-    [{ text: '\u{1F4B0} Model Price', callback_data: 'model_price' }, { text: '\u{1F4B3} Top Up', callback_data: 'top_up' }],
+    [{ text: '\u{1F48E} Kredit Token', callback_data: 'credits' }, { text: BUY_CREDITS_BUTTON, callback_data: 'top_up' }],
+    [{ text: '\u{1F4CB} Model & Multiplier', callback_data: 'cr_models' }, { text: '\u{1F9FE} Logs', callback_data: 'logs' }],
+    [{ text: '\u{1F4C8} Usage Summary', callback_data: 'usage' }],
     [{ text: '\u{1F511} Create new API key', callback_data: 'create_key' }, { text: '\u{1F5D1}\u{FE0F} Revoke API Key', callback_data: 'revoke' }],
     [{ text: '\u{1F3AB} Create a Ticket', callback_data: 'ticket' }, { text: '\u{1F519} Back to menu', callback_data: 'menu' }],
   ] };
@@ -1116,6 +1119,9 @@ async function statsMessage(telegramId) {
   const accessCard = modelAccessCard(await getModelAccess(telegramId).catch(() => null), userLanguage(user));
   const credit = await getCreditOverview(telegramId).catch(() => null);
   const activePass = credit?.passes?.active?.[0];
+  // With token credits, the old Rupiah card and spend line only show for users who still have them.
+  const showRupiah = !credit || Number(user.balance || 0) > 0 || bonusTokens > 0;
+  const spent = Number(stats.spent || 0);
   return [
     '\u{1F4CA} <b>API DASHBOARD</b>',
     DIVIDER,
@@ -1128,10 +1134,10 @@ async function statsMessage(telegramId) {
       credit.account.reserved > 0 && `Sedang direservasi: <b>${bigNumber(credit.account.reserved)}</b> kredit`,
       activePass && `\u{267E}\u{FE0F} ${escapeHtml(activePass.name || 'Unlimited')} aktif s/d <b>${escapeHtml(wibTime(activePass.endsAt))}</b>`,
     ])] : []),
-    card('\u{1F4B3} <b>Balance</b>', [
+    ...(showRupiah ? [card('\u{1F4B3} <b>Balance</b>', [
       `\u{1F4B0} Saldo: <b>${rupiah(user.balance)}</b>${credit ? ' <i>(saldo Rupiah lama, terpisah dari kredit)</i>' : ''}`,
       `\u{1F381} Bonus tokens: <b>${bigNumber(bonusTokens)}</b>${bonusTokens > 0 ? ' <i>(dipakai duluan)</i>' : ''}`,
-    ]),
+    ])] : []),
     ...(accessCard ? [accessCard] : []),
     card('\u{1F4C8} <b>Usage</b>', [
       `\u{1F4E8} Requests: <b>${formatTokens(requests)}</b>  (\u{26A0}\u{FE0F} ${formatTokens(errors)} error)`,
@@ -1139,7 +1145,7 @@ async function statsMessage(telegramId) {
       `\u{1F4E5} Input tokens: <b>${bigNumber(stats.inputTokens)}</b>`,
       `\u{1F4E4} Output tokens: <b>${bigNumber(stats.outputTokens)}</b>`,
       `\u{1F9EE} Total tokens: <b>${bigNumber(stats.totalTokens)}</b>`,
-      `\u{1F4B8} Spent: <b>${formatCost(stats.spent)}</b>`,
+      (!credit || spent > 0) && `\u{1F4B8} Spent: <b>${formatCost(stats.spent)}</b>${credit ? ' <i>(saldo Rupiah lama)</i>' : ''}`,
       `\u{1F552} Last used: <b>${escapeHtml(wibTime(user.lastUsedAt))}</b>`,
     ]),
     '',
@@ -1474,7 +1480,7 @@ async function creditMainView(telegramId) {
     '<i>Kredit tidak kedaluwarsa. Request kecil membayar sesuai pemakaiannya saja.</i>',
   );
   const rows = [
-    [{ text: '\u{1F6D2} Beli kredit', callback_data: 'top_up' }, { text: '\u{1F4CB} Model & multiplier', callback_data: 'cr_models' }],
+    [{ text: BUY_CREDITS_BUTTON, callback_data: 'top_up' }, { text: '\u{1F4CB} Model & multiplier', callback_data: 'cr_models' }],
     [{ text: '\u{1F9FE} Riwayat kredit', callback_data: 'cr_hist' }, { text: '\u{267E}\u{FE0F} Paket Unlimited', callback_data: 'cr_ul' }],
     [{ text: '\u{1F504} Refresh', callback_data: 'credits' }, { text: '\u{1F3E0} Menu', callback_data: 'menu' }],
   ];
@@ -1539,7 +1545,11 @@ async function creditModelsView(telegramId) {
   ].filter(Boolean).join('\n');
   let text = `${header}\n\n${sections.join('\n\n')}`;
   if (text.length > 4000) text = `${text.slice(0, 3980)}\n\u{2026}`;
-  return { text, reply_markup: { inline_keyboard: [creditBackRow()] } };
+  const rows = [[{ text: BUY_CREDITS_BUTTON, callback_data: 'top_up' }]];
+  // The old per-1M Rupiah price list only matters to users who still hold a Rupiah balance.
+  if (overview?.legacy?.balance > 0) rows.push([{ text: '\u{1F4B5} Harga saldo Rupiah lama', callback_data: 'model_price' }]);
+  rows.push(creditBackRow());
+  return { text, reply_markup: { inline_keyboard: rows } };
 }
 
 function ledgerLine(entry) {
@@ -4590,7 +4600,8 @@ async function handleCallbackQuery(query) {
 
   const paymentAction = action === 'top_up' || action === 'top_up_rp' || action.startsWith('topup_') || action.startsWith('crbuy_') || action.startsWith('ulbuy_');
   if (paymentAction && !await isPaymentsEnabled()) {
-    return telegram('sendMessage', { chat_id: chatId, text: PAYMENTS_OFF_MESSAGE, parse_mode: 'HTML', reply_markup: menuKeyboard(userId) });
+    const text = PAYMENTS_OFF_MESSAGE + (isAdmin(userId) ? PAYMENTS_OFF_ADMIN_HINT : '');
+    return telegram('sendMessage', { chat_id: chatId, text, parse_mode: 'HTML', reply_markup: menuKeyboard(userId) });
   }
   if (action === 'top_up') {
     // Token credit packages first; the old Rupiah top-up stays available behind its own button.

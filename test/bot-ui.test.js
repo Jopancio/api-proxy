@@ -106,6 +106,18 @@ test('credit menus, purchase, history and admin console work end to end', () => 
     assert.match(texts(24), /✅ Kredit <code>700001<\/code> -500\.000 → saldo 10\.500\.000/);
     assert.match(texts(25), /Token credits/);
     assert.match(texts(26), /Kredit token<\/b>\n[├└] Tersedia: <b>10\.500\.000/);
+    // Buying credit packages is one labelled button everywhere; no per-1M Rupiah price or
+    // Rupiah top-up for a user without an old Rupiah balance.
+    const buyButton = (index) => buttons(index).some((button) => button.callback_data === 'top_up' && button.text.includes('Beli Paket Token'));
+    for (const index of [2, 3, 26]) assert.ok(buyButton(index), `step ${index} has no Beli Paket Token button`);
+    assert.ok(!buttons(26).some((button) => button.callback_data === 'model_price'));
+    assert.ok(!buttons(3).some((button) => button.callback_data === 'model_price'));
+    assert.ok(!buttons(6).some((button) => button.callback_data === 'top_up_rp'));
+    assert.doesNotMatch(texts(26), /\/ ?1M|<b>Balance<\/b>|Spent:/);
+    // Payments closed: the buy button explains it; only the admin is told how to open it.
+    assert.match(texts(30), /Pembelian paket token sedang ditutup/);
+    assert.doesNotMatch(texts(30), /Enable Payments/);
+    assert.match(texts(31), /Pembelian paket token sedang ditutup[\s\S]*Enable Payments/);
     assert.match(texts(27), /KREDIT TOKEN/);
     assert.match(texts(28), /glm-5v-turbo<\/code> ×1,5/);
     assert.match(texts(28), /deepseek-v4-flash<\/code> ×1,5 <i>\(→ deepseek-v4\.1-flash\)<\/i>/);

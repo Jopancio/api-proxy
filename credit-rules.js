@@ -257,7 +257,9 @@ const DEFAULT_BILLING = Object.freeze({
   // Users with an old Rupiah balance keep using it with the old per-1M prices when they have no
   // credits (or the model has no credit rate yet). Credits and Rupiah are never mixed or converted.
   legacyRupiahEnabled: true,
-  legacyTopupEnabled: true,
+  // New Rupiah top-ups (per-1M pricing) are off: users buy token credit packages instead.
+  // `billing legacy_topup on` brings the old top-up button back.
+  legacyTopupEnabled: false,
 });
 
 const DEFAULT_UNLIMITED = Object.freeze({

@@ -41,7 +41,7 @@ npm run bot
 
 Create the bot with [@BotFather](https://t.me/BotFather), copy its token into
 `TELEGRAM_BOT_TOKEN`, then send `/start` to the bot. It will show the API
-Dashboard, Top up, Logs, and Redeem Code menu.
+Dashboard, Kredit Token, Beli Paket Token, Logs, and Redeem Code menu.
 
 The bot creates user API keys automatically and stores accounts, keys, request
 logs, and token totals in `data/users.json`. Requests made with a generated key
@@ -53,8 +53,10 @@ existing keys and balances.
 
 The API Dashboard lists every active key and its usage totals. Users can create
 additional keys or revoke an existing key; revoked keys are rejected by the
-proxy immediately. Dashboard actions include Logs, Usage Summary, Model Price,
-and Top Up Saldo. **Usage Summary** (also `/usage`) shows requests, tokens and
+proxy immediately. Dashboard actions include Kredit Token, Beli Paket Token,
+Model & Multiplier, Logs and Usage Summary. The old per-1M Rupiah price list
+(`/model`) is only linked from Model & Multiplier for users who still hold a
+Rupiah balance. **Usage Summary** (also `/usage`) shows requests, tokens and
 cost per model for today, the last 7 days (with a per-day breakdown) or the last
 30 days, in WIB. It is kept in `data/usage-daily.json` (last 31 days) and counts
 from the moment this feature was deployed.
@@ -136,7 +138,10 @@ remain free.
 
 ## Kredit token
 
-Pengguna membeli **kredit token** (menu **Kredit Token** / **Top up**, perintah `/kredit`).
+Pengguna membeli **kredit token** (tombol **🛒 Beli Paket Token** di menu, API Dashboard dan
+layar Kredit Token, atau perintah `/topup`; saldo lewat `/kredit`). Tombol ini butuh Payments
+dibuka (Admin Panel → Enable Payments). Top up saldo Rupiah lama mati secara default
+(`billing legacy_topup on` untuk menyalakannya lagi); saldo Rupiah yang sudah ada tetap terpakai.
 Kredit terpakai = (token input + token output yang ditagihkan) × multiplier model,
 dihitung dengan fixed-point (4 desimal) dan dibulatkan ke atas satu kredit sekali di akhir.
 Tidak ada minimum per request dan kredit tidak kedaluwarsa. 1 kredit = 1 token di model ×1;
