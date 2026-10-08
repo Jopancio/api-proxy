@@ -1,6 +1,9 @@
 # Dependencies
 node_modules/
 
+# Data
+data/
+
 # Local secrets and environment overrides
 .env
 .env.*
