@@ -113,7 +113,9 @@ live in `data/users.json` (`accessCodes`, plus `modelAccess` on the user). The
 data layer refuses to create or disable codes for anyone other than
 `ADMIN_TELEGRAM_ID` (default `6957236291`, set it on both hosts when they are split).
 
-Top ups use Cashi.id. Set the Cashi API key and webhook secret, then configure
+Top ups use the QRIS Custom channel of Cashi.id (`kode_channel: "qris_custom"`).
+Token credit purchases, unlimited packages, and Rupiah top ups all select this channel explicitly,
+with no fallback to the default QRIS channel. Set the Cashi API key and webhook secret, then configure
 your Cashi webhook URL as:
 
 ```text
@@ -122,6 +124,39 @@ https://your-domain.example/webhooks/cashi
 
 The webhook verifies `x-gateway-signature` with HMAC-SHA256 and credits a
 pending order only after Cashi sends `PAYMENT_SETTLED` with status `SETTLED`.
+
+### Wajib bergabung ke grup
+
+Bot memeriksa keanggotaan **kedua grup**, `@galaxy_hub_api` dan `@galaxy_testi`, sebelum memproses setiap interaksi pribadi,
+termasuk `/start`, perintah lain, tombol menu lama, redeem, pembayaran, dan media ticket.
+Pengguna yang belum bergabung ke keduanya melihat tombol **Join Galaxy Hub API**,
+**Join Galaxy Testi**, dan **Verifikasi Ulang**. Kedua tombol grup memakai URL Telegram
+yang bisa diklik. Status setiap grup ditampilkan; bergabung ke satu grup saja belum cukup.
+Verifikasi berhasil melanjutkan alur `/start` (pemilihan bahasa untuk pengguna baru).
+Member, admin, pemilik grup, serta anggota restricted dengan `is_member: true` boleh masuk.
+Jika Telegram gagal memeriksa anggota, fitur tetap terkunci sampai pemeriksaan berhasil.
+Tidak ada cache kelulusan: keluar dari salah satu grup mengunci interaksi bot berikutnya,
+termasuk untuk pengguna lama yang sudah memiliki akun.
+Referral pada `/start ref_...` disimpan di tombol verifikasi dan diproses setelah bergabung.
+Bot mengabaikan pesan grup agar tidak mengirim data akun atau menu pribadi ke grup.
+Pemeriksaan ini membatasi fitur bot; API key yang sudah diterbitkan tetap mengikuti aturan API.
+
+Tambahkan bot sebagai **admin** di https://t.me/galaxy_hub_api dan https://t.me/galaxy_testi sebelum mengaktifkan pembaruan.
+Telegram hanya menjamin `getChatMember` untuk pengguna lain jika bot menjadi admin grup:
+https://core.telegram.org/bots/api#getchatmember .
+Upload `telegram-bot.js` terbaru ke hosting bot dan restart satu proses bot di sana.
+Log `[membership] Ready: bot is admin in ...` untuk masing-masing grup menandakan izin grup siap;
+pesan `Jadikan bot admin` atau `member list is inaccessible` berarti izin grup perlu diperbaiki.
+
+**Admin Panel → Verifikasi Semua User** menampilkan kedua grup dan tombol untuk
+menyiapkan pengiriman pesan verifikasi ke seluruh pengguna terdaftar. Pratinjau menampilkan
+jumlah penerima dan isi pesan sebelum admin menekan **Kirim Verifikasi ke Semua User**.
+Pengiriman berjalan di latar belakang dengan progres berhasil/gagal/tidak terjangkau;
+pesan berisi kedua tombol grup serta Verifikasi Ulang. Bot tidak menganggap pesan terkirim
+sebagai bukti sudah join: setiap pengguna tetap harus lolos pemeriksaan Telegram.
+Tombol kirim hanya berlaku sekali, kedaluwarsa dalam 10 menit, dan tidak bisa mengirim
+ulang saat pekerjaan sebelumnya berjalan. Tombol Batal membatalkan pratinjau.
+Pembaruan kode tidak otomatis mengirim pesan massal; pengiriman dimulai oleh admin di panel.
 
 Billing uses the token counts the upstream reports. For streaming
 `chat/completions` requests the proxy adds `stream_options.include_usage`, so
@@ -138,7 +173,7 @@ remain free.
 
 ## Kredit token
 
-Pengguna membeli **kredit token** (tombol **🛒 Beli Paket Token** di menu, API Dashboard dan
+Pengguna membeli **kredit token** (tombol **🛒 Beli Paket Token** di API Dashboard dan
 layar Kredit Token, atau perintah `/topup`; saldo lewat `/kredit`). Tombol ini butuh Payments
 dibuka (Admin Panel → Enable Payments). Top up saldo Rupiah lama mati secara default
 (`billing legacy_topup on` untuk menyalakannya lagi); saldo Rupiah yang sudah ada tetap terpakai.
@@ -201,20 +236,106 @@ Kebijakan bila usage tidak ada:
 ### Pembayaran
 
 Order kredit/unlimited dibuat di server lebih dulu (harga dan isi dari konfigurasi server), baru
-Cashi diminta QR dengan jumlah itu. Kredit ditambahkan hanya bila webhook Cashi yang ditandatangani
+Cashi diminta QR melalui channel `qris_custom` dengan jumlah itu. Perubahan channel berada di
+`telegram-bot.js`: unggah file terbaru lalu restart bot di hosting bot agar berlaku untuk order baru.
+Order yang sudah dibuat tetap memakai QR sebelumnya dan masih bisa diverifikasi.
+Kredit ditambahkan hanya bila webhook Cashi yang ditandatangani
 (atau Refresh status yang mengecek Cashi) menyatakan `SETTLED` untuk order itu dengan jumlah ≥ harga.
-Webhook berulang tidak menambah kredit lagi. Bila jumlah tidak dikirim/kurang, order tetap pending;
+Jika `check-status` tidak mengirim `amount`, bot membaca `total_amount` (atau `amount`) dari
+`https://cashi.id/api/checkout/:orderId`, endpoint yang dipakai halaman pembayaran Cashi.
+Nomor order dan status `SETTLED` harus cocok dengan pengecekan status ber-API key; harga paket
+lokal tidak dipakai sebagai pengganti nominal. Webhook bertanda tangan yang tidak mengirim
+jumlah juga memakai pengecekan ini. Pastikan `CASHI_API_KEY` tersedia di server API dan bot.
+Panggilan `settlePayment` dari bot terpisah melalui internal RPC juga memeriksa nominal kosong,
+sehingga bot lama tetap dapat memverifikasi order setelah server API diperbarui.
+Bot menampilkan jumlah dibayar pada konfirmasi. Webhook berulang tidak menambah kredit lagi.
+
+Pembayaran baru yang berhasil diverifikasi juga mengantrekan pesan otomatis ke
+`@galaxy_testi` (https://t.me/galaxy_testi), misalnya:
+
+```text
+✅ Pembayaran Berhasil!
+
+User: Bo***
+Membeli: Paket 10.000.000 Kredit Token
+Total dibayar: Rp4.078
+```
+
+Nama memakai maksimal dua huruf awal (nama sangat pendek disamarkan lebih banyak).
+Pesan tidak memuat username lengkap, ID Telegram, nomor order, atau API key.
+Produk mengikuti order saat dibeli: paket kredit, unlimited beserta durasi, atau top up Rupiah.
+Nominal menggunakan `paidAmount` terverifikasi, termasuk kode unik pembayaran.
+Top up admin, refund, konfirmasi manual dengan nominal perkiraan, dan order lama sebelum
+pembaruan tidak dipublikasikan otomatis.
+
+Antrean `paymentTestimonial` ditulis bersama status lunas dalam transaksi penyimpanan yang sama.
+Pada hosting terpisah, pengirim berjalan di server API dan memakai `TELEGRAM_BOT_TOKEN` di sana;
+bot Telegram tidak perlu polling ganda. Pada mode data lokal, bot juga menjalankan pengirim,
+dengan klaim file terkunci agar server dan bot tidak mengirim order yang sama dua kali.
+Upload `payment-testimonials.js`, `credit-store.js`, `usage-db.js`, dan `server.js` ke API.
+Pastikan bot boleh mengirim pesan ke grup; bila tujuan adalah channel, beri hak memposting.
+Pada VPS ini, jalankan API dengan `node --dns-result-order=ipv4first server.js` karena
+koneksi IPv6 menuju Telegram bermasalah. Opsi ini tetap perlu disertakan saat restart.
+
+Pengiriman dibatasi satu pesan per 3,1 detik per proses. Penolakan eksplisit Telegram
+(misalnya 403/429) disimpan untuk dicoba ulang dengan jeda, tanpa membatalkan pembayaran.
+Jika koneksi putus setelah pengiriman atau proses mati sebelum hasil dicatat, status menjadi
+`uncertain` dan tidak dikirim ulang otomatis, karena Telegram tidak mendukung kunci idempotensi
+untuk `sendMessage`. Admin perlu memeriksa grup sebelum memutuskan pengiriman ulang kasus ini.
+Status `sent` menyimpan ID pesan dan tetap mencegah pengiriman ulang sesudah restart atau Refresh.
+
+Bila jumlah tetap tidak tersedia/kurang, order tetap pending (kegagalan cek webhook dapat dicoba ulang);
 admin bisa memeriksa lalu `order <id> konfirmasi`. Order top up Rupiah lama (`TG-...`) tetap seperti dulu
 (kini jumlah yang dilaporkan lebih kecil dari order juga ditolak).
 
 ### Paket unlimited
 
-Durasi 1/3/6/12/24 jam, harga awal kosong dan **tidak dijual** sampai admin menetapkan harga,
+Durasi 1/3/6/12/24/72/168 jam (hingga 7 hari), harga awal kosong dan **tidak dijual** sampai admin menetapkan harga,
 mengaktifkan durasi, mengisi daftar model, lalu `unlimited jual on`. Batas per user: request
 bersamaan, request/menit, output maksimal. Model, batas dan harga disalin ke paket saat dibeli.
 Membeli lagi saat aktif = paket baru mulai setelah paket sekarang berakhir.
 
+Preset **Unlimited Model China** memakai model aktif yang tercantum di upstream dari keluarga
+DeepSeek, Kimi, GLM, Qwen, MiniMax, dan Hunyuan (Hy). Model pending, belum tersedia, serta alias/routing
+ke keluarga lain tidak dimasukkan. Daftar disimpan eksplisit saat preset diterapkan, sehingga model
+baru tidak otomatis ikut paket. Tarif dan daftar model dari paket yang sudah dibeli tetap memakai snapshot.
+
+| Durasi | Harga awal |
+| --- | ---: |
+| 1 jam | Rp2.000 |
+| 3 jam | Rp4.000 |
+| 6 jam | Rp6.000 |
+| 12 jam | Rp8.000 |
+| 1 hari | Rp12.000 |
+| 3 hari | Rp29.000 |
+| 7 hari | Rp59.000 |
+
+Tidak ada kuota kredit harian untuk model dalam paket. Batas pemakaian: 1 request bersamaan,
+10 request/menit, output maksimal 8.192 token/request. Model lain memakai saldo kredit biasa.
+Harga ini adalah harga jual awal toko, bukan perhitungan margin dari biaya upstream yang belum tersedia.
+
+Jalankan dari folder proyek (host API pada instalasi terpisah):
+
+```powershell
+node scripts/configure-china-unlimited.js          # pratinjau, tanpa menulis data
+node scripts/configure-china-unlimited.js --apply  # backup config, terapkan, aktifkan penjualan terakhir
+```
+
+Script hanya memperbarui konfigurasi unlimited dan Audit. Saldo, order, API key, serta multiplier
+tetap tersimpan. Menjalankan ulang preset yang sama tidak membuat perubahan tambahan.
+Upload `credit-rules.js` terbaru ke API dan bot untuk dukungan durasi harian; `telegram-bot.js`
+terbaru menampilkan label hari dan tombol Unlimited Model China di API Dashboard.
+
 ### Perintah admin
+
+Pengaturan cepat: **Admin Panel → Atur Multiplier → pilih model**. Tekan nilai preset untuk
+langsung menyimpan, atau **Masukkan nilai sendiri** (contoh `1,75`; lebih dari 0, maksimal 1000,
+hingga 4 desimal). Gunakan **Cari model** atau pindah halaman untuk menemukan model.
+Tombol ini menyamakan multiplier input, cache, dan output; layar menjelaskan bila ada tarif
+komponen terpisah yang akan diganti. Untuk alias/routing, yang diubah adalah model tujuan tarif
+dan mapping tetap tersimpan. Alias tanpa tujuan harus dipetakan terlebih dahulu.
+Perubahan berlaku pada request baru dan tercatat di Audit; tombol dengan versi konfigurasi
+lama meminta admin membuka nilai terbaru sebelum menyimpan.
 
 Admin Panel → **Kredit & Paket** → **Ketik perintah** (boleh beberapa baris sekaligus). Semua
 perintah diperiksa di server terhadap `ADMIN_TELEGRAM_ID` dan dicatat (Audit / ledger).
@@ -250,9 +371,9 @@ node scripts/migrate-credits.js          # dry run: hanya laporan
 node scripts/migrate-credits.js --apply  # backup ke data/backups/pre-credits-<waktu>/, lalu buat data/credits.json
 ```
 
-Upload ke host: `credit-rules.js`, `credit-config.js`, `credit-store.js`, `server.js`, `usage-db.js`,
+Upload ke host: `credit-rules.js`, `credit-config.js`, `credit-store.js`, `cashi-client.js`, `server.js`, `usage-db.js`,
 `data-client.js`, `telegram-bot.js`, `scripts/migrate-credits.js`. Pada hosting terpisah, host bot
-butuh `credit-rules.js` (dan semua file kredit bila bot memakai data lokal). Jalankan migrasi di host `server.js`, lalu restart `server.js`
+butuh `credit-rules.js` dan `cashi-client.js` (dan semua file kredit bila bot memakai data lokal). Jalankan migrasi di host `server.js`, lalu restart `server.js`
 dan `telegram-bot.js`. Kredit baru aktif bila Free Mode OFF dan Payments OPEN.
 
 Rollback: hentikan kedua service, kembalikan file kode versi sebelumnya (git), restart. Saldo Rupiah

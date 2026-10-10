@@ -22,7 +22,7 @@ const MODEL_NAME = /^[a-z0-9][a-z0-9._:+-]{0,99}$/;
 const PROVIDER_NAME = /^[a-z0-9][a-z0-9._-]{0,39}$/;
 const PACKAGE_ID = /^[a-z0-9][a-z0-9-]{0,23}$/;
 const EFFORT_NAME = /^[a-z][a-z0-9_-]{0,23}$/;
-const UNLIMITED_HOURS = [1, 3, 6, 12, 24];
+const UNLIMITED_HOURS = [1, 3, 6, 12, 24, 72, 168];
 
 // ---------- Fixed-point multipliers ----------
 

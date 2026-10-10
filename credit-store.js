@@ -21,6 +21,7 @@ const crypto = require('crypto');
 const rules = require('./credit-rules');
 const creditConfig = require('./credit-config');
 const usageDb = require('./usage-db');
+const testimonials = require('./payment-testimonials');
 
 const statePath = process.env.CREDIT_STATE_PATH
   ? path.resolve(__dirname, process.env.CREDIT_STATE_PATH)
@@ -583,6 +584,8 @@ function applyPayment(state, tx, order, paidAmount, meta) {
   order.settledBy = meta.source || '';
   order.ledgerSeq = entry.seq;
   if (meta.confirmedBy) order.confirmedBy = meta.confirmedBy;
+  // Manual confirmation substitutes the local price, not a gateway-verified amount.
+  if (meta.source !== 'admin') testimonials.queuePaymentTestimonial(order);
   return { settled: true, kind: order.kind, orderId: order.orderId, userId: order.userId, credits: order.kind === 'credits' ? order.credits : 0, balance: account.balance, pass };
 }
 
@@ -592,7 +595,10 @@ function applyPayment(state, tx, order, paidAmount, meta) {
 // Rupiah top-up (usage-db.js settleOrder), unchanged.
 function settlePayment(orderId, amount, status = 'SETTLED', meta = {}) {
   const id = String(orderId || '');
-  if (!readState().orders[id]) return usageDb.settleOrder(id, amount);
+  if (!readState().orders[id]) {
+    if (String(status || '').toUpperCase() !== 'SETTLED') return { settled: false, reason: 'not_settled', orderId: id };
+    return usageDb.settleOrder(id, amount);
+  }
   return mutateState((state, tx) => {
     const order = state.orders[id];
     if (order.status === 'SETTLED') {
@@ -625,6 +631,26 @@ function adminConfirmCreditOrder(orderId, actorId) {
       return { settled: false, alreadySettled: true, orderId: order.orderId, userId: order.userId };
     }
     return applyPayment(state, tx, order, order.priceIdr, { source: 'admin', confirmedBy: String(actorId).trim() });
+  });
+}
+
+function listPendingPaymentTestimonials(now = Date.now()) {
+  return Object.values(readState().orders).filter(order => testimonials.testimonialDue(order, now)).slice(0, 50).map(order => order.orderId);
+}
+
+function claimPaymentTestimonial(orderId, now = Date.now()) {
+  return mutateState((state, tx) => {
+    const order = state.orders[orderId];
+    if (!testimonials.testimonialDue(order, now)) { tx.unchanged = true; return null; }
+    return testimonials.claimPaymentTestimonial(order, usageDb.getUser(order.userId) || {}, now);
+  });
+}
+
+function completePaymentTestimonial(orderId, claim, outcome, now = Date.now()) {
+  return mutateState((state, tx) => {
+    const changed = testimonials.completePaymentTestimonial(state.orders[orderId], claim, outcome, now);
+    if (!changed) tx.unchanged = true;
+    return changed;
   });
 }
 
@@ -716,5 +742,6 @@ module.exports = {
   readState, getCreditAccount, getUserBillingState, getCreditOverview, getCreditOrder, listCreditOrders, getCreditStats, readLedger,
   reserveCredits, settleReservation, releaseReservation, sweepReservations,
   createCreditOrder, markCreditOrderFailed, settlePayment, adminConfirmCreditOrder,
+  listPendingPaymentTestimonials, claimPaymentTestimonial, completePaymentTestimonial,
   adjustCredits, refundCredits, passStatus, initializeCreditState,
 };

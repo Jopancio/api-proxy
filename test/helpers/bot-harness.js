@@ -30,11 +30,25 @@ const press = (id, data) => ({
 function lastStatusButton() {
   for (let i = transcript.length - 1; i >= 0; i -= 1) {
     const rows = transcript[i].payload?.reply_markup?.inline_keyboard || [];
-    const button = rows.flat().find((item) => String(item.callback_data || '').startsWith('status_KR-'));
+    const button = rows.flat().find((item) => /^status_(KR|UL)-/.test(item.callback_data || ''));
     if (button) return button.callback_data;
   }
   throw new Error('no refresh status button was sent');
 }
+
+function lastButton(predicate) {
+  for (let index = transcript.length - 1; index >= 0; index -= 1) {
+    const buttons = transcript[index].payload?.reply_markup?.inline_keyboard?.flat() || [];
+    const button = buttons.find(predicate);
+    if (button) return button.callback_data;
+  }
+  throw new Error('expected UI button was not found');
+}
+
+const uiStep = (label, build) => Object.assign(build, { label });
+const modelButton = (name) => lastButton(button => /^admin_cr_rate_[a-f0-9]{12}$/.test(button.callback_data || '') && button.text.endsWith(` ${name}`));
+const textButton = (label) => lastButton(button => button.text === label);
+let staleMultiplierButton;
 
 const STEPS = [
   () => ({ message: message(USER, '/start') }),
@@ -69,6 +83,61 @@ const STEPS = [
   () => ({ callback_query: press(ADMIN, 'admin_payments_toggle') }),
   () => ({ callback_query: press(USER, 'top_up') }),
   () => ({ callback_query: press(ADMIN, 'top_up') }),
+  uiStep('multiplier_list', () => ({ callback_query: press(ADMIN, 'admin_cr_rates') })),
+  uiStep('multiplier_denied', () => ({ callback_query: press(USER, modelButton('glm-5v-turbo')) })),
+  uiStep('multiplier_detail', () => ({ callback_query: press(ADMIN, modelButton('glm-5v-turbo')) })),
+  uiStep('multiplier_preset', () => {
+    staleMultiplierButton = textButton('\u00d72');
+    return { callback_query: press(ADMIN, staleMultiplierButton) };
+  }),
+  uiStep('multiplier_stale', () => ({ callback_query: press(ADMIN, staleMultiplierButton) })),
+  uiStep('multiplier_custom', () => ({ callback_query: press(ADMIN, textButton('\u2328\ufe0f Masukkan nilai sendiri')) })),
+  uiStep('multiplier_zero', () => ({ message: message(ADMIN, '0') })),
+  uiStep('multiplier_large', () => ({ message: message(ADMIN, '1001') })),
+  uiStep('multiplier_precision', () => ({ message: message(ADMIN, '1,23456') })),
+  uiStep('multiplier_saved', () => ({ message: message(ADMIN, '1,875') })),
+  uiStep('multiplier_search', () => ({ callback_query: press(ADMIN, 'admin_cr_rates_search') })),
+  uiStep('multiplier_filtered', () => ({ message: message(ADMIN, 'deepseek-v4-flash') })),
+  uiStep('multiplier_routed', () => ({ callback_query: press(ADMIN, modelButton('deepseek-v4-flash')) })),
+  uiStep('multiplier_routed_saved', () => ({ callback_query: press(ADMIN, textButton('\u00d72,5')) })),
+  uiStep('multiplier_filter_back', () => ({ callback_query: press(ADMIN, 'admin_cr_rates_back') })),
+  uiStep('multiplier_search_again', () => ({ callback_query: press(ADMIN, 'admin_cr_rates_search') })),
+  uiStep('multiplier_empty', () => ({ message: message(ADMIN, 'does-not-exist') })),
+  uiStep('multiplier_all', () => ({ callback_query: press(ADMIN, 'admin_cr_rates') })),
+  uiStep('multiplier_page_next', () => ({ callback_query: press(ADMIN, 'admin_cr_rates_page_1') })),
+  uiStep('multiplier_page_back', () => ({ callback_query: press(ADMIN, 'admin_cr_rates_page_0') })),
+  uiStep('multiplier_alias', () => ({ callback_query: press(ADMIN, modelButton('claude')) })),
+  uiStep('multiplier_cancel_list', () => ({ callback_query: press(ADMIN, 'admin_cr_rates') })),
+  uiStep('multiplier_cancel_detail', () => ({ callback_query: press(ADMIN, modelButton('glm-5v-turbo')) })),
+  uiStep('multiplier_cancel_prompt', () => ({ callback_query: press(ADMIN, textButton('\u2328\ufe0f Masukkan nilai sendiri')) })),
+  uiStep('multiplier_cancelled', () => ({ callback_query: press(ADMIN, textButton('\u{1F519} Batal')) })),
+  uiStep('multiplier_cancel_text', () => ({ message: message(ADMIN, '7') })),
+  uiStep('multiplier_split_console', () => ({ callback_query: press(ADMIN, 'admin_cr_cmd') })),
+  uiStep('multiplier_split_setup', () => ({ message: message(ADMIN, 'tarif glm-5v-turbo input 0.25') })),
+  uiStep('multiplier_split_list', () => ({ callback_query: press(ADMIN, 'admin_cr_rates') })),
+  uiStep('multiplier_split_detail', () => ({ callback_query: press(ADMIN, modelButton('glm-5v-turbo')) })),
+  uiStep('multiplier_split_saved', () => ({ callback_query: press(ADMIN, textButton('\u00d71,5')) })),
+  uiStep('multiplier_long_search', () => ({ callback_query: press(ADMIN, 'admin_cr_rates_search') })),
+  uiStep('multiplier_long_results', () => ({ message: message(ADMIN, 'glm-long-model') })),
+  uiStep('multiplier_long_detail', () => ({ callback_query: press(ADMIN, modelButton(`glm-${'long-model-'.repeat(7)}test`)) })),
+  uiStep('multiplier_long_saved', () => ({ callback_query: press(ADMIN, textButton('\u00d71,25')) })),
+  uiStep('multiplier_slash_prompt', () => ({ callback_query: press(ADMIN, textButton('\u2328\ufe0f Masukkan nilai sendiri')) })),
+  uiStep('multiplier_slash_cancel', () => ({ message: message(ADMIN, '/start') })),
+  uiStep('multiplier_slash_text', () => ({ message: message(ADMIN, '9') })),
+  uiStep('china_setup', () => {
+    const config = require(path.join(ROOT, 'credit-config'));
+    const { buildChinaUnlimitedPlan } = require(path.join(ROOT, 'scripts', 'configure-china-unlimited'));
+    for (const change of buildChinaUnlimitedPlan(config.getCreditCatalog()).changes) config.updateCreditConfig(change, ADMIN);
+    return { callback_query: press(ADMIN, 'admin_payments_toggle') };
+  }),
+  uiStep('china_shop', () => ({ callback_query: press(USER, 'cr_ul') })),
+  uiStep('china_buy_day', () => ({ callback_query: press(USER, 'ulbuy_72') })),
+  uiStep('china_paid_day', () => ({ callback_query: press(USER, lastStatusButton()) })),
+  uiStep('china_buy_week', () => ({ callback_query: press(USER, 'ulbuy_168') })),
+  uiStep('china_paid_week', () => ({ callback_query: press(USER, lastStatusButton()) })),
+  uiStep('china_active', () => ({ callback_query: press(USER, 'cr_ul') })),
+  uiStep('china_history', () => ({ callback_query: press(USER, 'cr_hist') })),
+  uiStep('rupiah_buy', () => ({ callback_query: press(USER, 'topup_10000') })),
 ];
 
 function finish(error) {
@@ -83,7 +152,7 @@ async function nextUpdates() {
   }
   const step = stepIndex;
   stepIndex += 1;
-  transcript.push({ step });
+  transcript.push({ step, label: STEPS[step].label });
   return [{ update_id: updateId++, ...STEPS[step]() }];
 }
 
@@ -94,6 +163,7 @@ globalThis.fetch = async (url, options = {}) => {
     const payload = typeof options.body === 'string' ? JSON.parse(options.body) : { multipart: true };
     if (method === 'getUpdates') return json({ ok: true, result: await nextUpdates() });
     if (method === 'getMe') return json({ ok: true, result: { id: 1, is_bot: true, username: 'test_bot' } });
+    if (method === 'getChatMember') return json({ ok: true, result: { status: payload.user_id === 1 ? 'administrator' : 'member' } });
     transcript.push({ method, payload });
     if (method === 'sendMessage' || method === 'sendPhoto') return json({ ok: true, result: { message_id: ++messageId, chat: { id: payload.chat_id } } });
     return json({ ok: true, result: true });
@@ -106,7 +176,13 @@ globalThis.fetch = async (url, options = {}) => {
   if (href.startsWith('https://cashi.id/api/check-status/')) {
     const orderId = decodeURIComponent(href.split('/').pop());
     const order = cashiOrders.find((entry) => entry.order_id === orderId);
+    if (process.env.CASHI_TEST_STATUS_MODE === 'without_amount') return json({ success: true, status: 'SETTLED', provider_tx_id: null, is_final: true });
     return json({ success: true, status: 'SETTLED', amount: order ? order.amount : 0 });
+  }
+  if (href.startsWith('https://cashi.id/api/checkout/')) {
+    const orderId = decodeURIComponent(href.split('/').pop());
+    const order = cashiOrders.find((entry) => entry.order_id === orderId);
+    return json({ success: true, data: { order_id: orderId, status: 'SETTLED', amount: String(order?.amount || 0), total_amount: order?.amount || 0 } });
   }
   throw new Error(`unexpected network call in the bot test: ${href}`);
 };

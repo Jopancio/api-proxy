@@ -2,6 +2,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const testimonials = require('./payment-testimonials');
 const { getBillingPrice, getModelFamily, PINNED_MODELS } = require('./pricing');
 const { getReferralSettings } = require('./admin-settings');
 
@@ -225,7 +226,9 @@ function createOrder(telegramId, order) {
     const id = String(telegramId);
     const user = database.users[id] || newUser(id);
     user.orders.push({ ...order, createdAt: new Date().toISOString(), status: 'PENDING' });
-    user.orders = user.orders.slice(-50);
+    // Keep unfinished notifications even when the visible order history rolls over.
+    const history = user.orders.slice(-50);
+    user.orders = [...user.orders.slice(0, -50).filter(entry => ['pending', 'sending', 'uncertain'].includes(entry.paymentTestimonial?.status)), ...history];
     database.users[id] = user;
     return user.orders[user.orders.length - 1];
   });
@@ -248,10 +251,37 @@ function settleOrder(orderId, amount) {
       order.status = 'SETTLED';
       order.settledAt = new Date().toISOString();
       order.paidAmount = Number(reported ?? order.amount);
+      // Legacy settlement may infer a missing amount. Never publish that inference.
+      if (reported !== null) testimonials.queuePaymentTestimonial(order);
       user.balance += Number(order.amount);
       return { settled: true, userId: user.telegramId, balance: user.balance };
     }
     return null;
+  });
+}
+
+function listPendingPaymentTestimonials(now = Date.now()) {
+  return Object.values(readDatabase().users).flatMap(user => user.orders || [])
+    .filter(order => testimonials.testimonialDue(order, now)).slice(0, 50).map(order => order.orderId);
+}
+
+function claimPaymentTestimonial(orderId, now = Date.now()) {
+  return mutateDatabase(database => {
+    for (const user of Object.values(database.users)) {
+      const order = (user.orders || []).find(entry => entry.orderId === orderId);
+      if (order) return testimonials.claimPaymentTestimonial(order, user, now);
+    }
+    return null;
+  });
+}
+
+function completePaymentTestimonial(orderId, claim, outcome, now = Date.now()) {
+  return mutateDatabase(database => {
+    for (const user of Object.values(database.users)) {
+      const order = (user.orders || []).find(entry => entry.orderId === orderId);
+      if (order) return testimonials.completePaymentTestimonial(order, claim, outcome, now);
+    }
+    return false;
   });
 }
 
@@ -1754,6 +1784,7 @@ function listUsersPage({ page = 0, pageSize = USERS_PAGE_DEFAULT, query = '' } =
 }
 
 module.exports = { ensureUser, setUserLanguage, SUPPORTED_LANGUAGES, createApiKey, findUserByApiKey, recordUsage, getUser, getAllUsers, recordAdminRequest, getAdminLogs, addBalance, adjustBalance, getOrder, revokeApiKey, createOrder, settleOrder, createRedeemCode, redeemCode, listRedeemCodes, disableRedeemCode, normalizeRedeemCode, getAdminStats, resetStats, databasePath,
+  listPendingPaymentTestimonials, claimPaymentTestimonial, completePaymentTestimonial,
   createAccessCode, redeemAccessCode, listAccessCodes, getAccessCode, disableAccessCode, getModelAccess, modelAccessFor,
   ACCESS_CODE_PATTERN, MAX_ACCESS_MODELS, MAX_ACCESS_PERIOD_MS, MAX_ACCESS_AHEAD_MS, DEFAULT_ACCESS_REDEEM_WINDOW_MS,
   getReferralInfo, startWithReferral,

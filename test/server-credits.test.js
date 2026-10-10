@@ -17,6 +17,9 @@ const ROOT = path.join(__dirname, '..');
 const ADMIN = '6957236291';
 const DATA = fs.mkdtempSync(path.join(process.env.KIROCREW_SCRATCH || os.tmpdir(), 'credits-e2e-'));
 const WEBHOOK_SECRET = crypto.randomBytes(16).toString('hex');
+const INTERNAL_SECRET = crypto.randomBytes(16).toString('hex');
+const CASHI_FIXTURES = path.join(DATA, 'cashi-fixtures.json');
+fs.writeFileSync(CASHI_FIXTURES, '{}');
 Object.assign(process.env, {
   USAGE_DB_PATH: path.join(DATA, 'users.json'),
   ADMIN_SETTINGS_PATH: path.join(DATA, 'settings.json'),
@@ -98,7 +101,7 @@ const serverLog = [];
 test.before(async () => {
   await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
   const port = await freePort();
-  server = spawn(process.execPath, [path.join(ROOT, 'server.js')], {
+  server = spawn(process.execPath, ['--require', path.join(__dirname, 'helpers', 'cashi-fetch-stub.js'), path.join(ROOT, 'server.js')], {
     cwd: DATA, // no .env here: nothing of the real configuration is loaded
     env: {
       ...process.env,
@@ -107,8 +110,10 @@ test.before(async () => {
       UPSTREAM_BASE_URL: `http://127.0.0.1:${upstream.address().port}/v1`,
       UPSTREAM_API_KEY: 'mock-upstream-key',
       CASHI_SECRET_KEY: WEBHOOK_SECRET,
+      CASHI_API_KEY: 'test-cashi-key',
+      CASHI_TEST_FIXTURES: CASHI_FIXTURES,
       TELEGRAM_BOT_TOKEN: '',
-      INTERNAL_API_SECRET: '',
+      INTERNAL_API_SECRET: INTERNAL_SECRET,
       FORCE_STREAM_USAGE: 'true',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -352,16 +357,101 @@ test('Cashi webhook: credits once, rejects a wrong amount, old Rupiah orders unc
   const settledEvent = (orderId, amount) => ({ event: 'PAYMENT_SETTLED', data: { status: 'SETTLED', order_id: orderId, amount } });
   assert.equal((await send(settledEvent(order.orderId, 3_999))).status, 200);
   assert.equal(store.getCreditAccount(account.id).balance, 0);
+  assert.equal(store.getCreditOrder(account.id, order.orderId).paymentTestimonial, undefined);
   for (let i = 0; i < 3; i += 1) assert.equal((await send(settledEvent(order.orderId, 4_000))).status, 200);
   assert.equal(store.getCreditAccount(account.id).balance, 10_000_000);
   assert.equal(store.readLedger({ userId: account.id, type: 'purchase' }).length, 1);
+  assert.equal(store.getCreditOrder(account.id, order.orderId).paymentTestimonial.status, 'pending');
+  assert.equal(store.getCreditOrder(account.id, order.orderId).paymentTestimonial.attempts, 0);
   const forged = await fetch(`${base}/webhooks/cashi`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-gateway-signature': 'bad' }, body: JSON.stringify(settledEvent(order.orderId, 4_000)) });
   assert.equal(forged.status, 401);
   usageDb.createOrder(account.id, { orderId: `TG-${account.id}-legacy`, amount: 25_000 });
   await send(settledEvent(`TG-${account.id}-legacy`, 25_000));
   await send(settledEvent(`TG-${account.id}-legacy`, 25_000));
   assert.equal(usageDb.getUser(account.id).balance, 25_000);
+  assert.equal(usageDb.getOrder(account.id, `TG-${account.id}-legacy`).paymentTestimonial.status, 'pending');
   assert.equal(store.getCreditAccount(account.id).balance, 10_000_000);
+});
+
+test('signed webhook without amount resolves Cashi checkout, rejects unverifiable payments, and credits once', async () => {
+  const account = user();
+  const order = store.createCreditOrder(account.id, { kind: 'credits', packageId: 'kredit-10m' });
+  const send = () => {
+    const raw = JSON.stringify({ event: 'PAYMENT_SETTLED', data: { order_id: order.orderId, status: 'SETTLED' } });
+    return fetch(`${base}/webhooks/cashi`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-gateway-signature': crypto.createHmac('sha256', WEBHOOK_SECRET).update(raw).digest('hex') },
+      body: raw,
+    });
+  };
+  const setCheckout = (data, status = 200) => fs.writeFileSync(CASHI_FIXTURES, JSON.stringify({
+    [`/api/check-status/${order.orderId}`]: { body: { success: true, status: 'SETTLED', is_final: true } },
+    [`/api/checkout/${order.orderId}`]: { status, body: { success: status === 200, data } },
+  }));
+  setCheckout(null, 503);
+  assert.equal((await send()).status, 502);
+  assert.equal(store.getCreditAccount(account.id).balance, 0);
+  setCheckout({ order_id: 'other-order', status: 'SETTLED', total_amount: 4000 });
+  assert.equal((await send()).status, 502);
+  assert.equal(store.getCreditAccount(account.id).balance, 0);
+  setCheckout({ order_id: order.orderId, status: 'PENDING', total_amount: 4000 });
+  assert.equal((await send()).status, 502);
+  assert.equal(store.getCreditAccount(account.id).balance, 0);
+  setCheckout({ order_id: order.orderId, status: 'SETTLED' });
+  assert.equal((await send()).status, 503);
+  assert.equal(store.getCreditAccount(account.id).balance, 0);
+  setCheckout({ order_id: order.orderId, status: 'SETTLED', total_amount: 3999 });
+  assert.equal((await send()).status, 200);
+  assert.equal(store.getCreditAccount(account.id).balance, 0);
+  setCheckout({ order_id: order.orderId, status: 'SETTLED', total_amount: 4000, net_amount: '3972.00' });
+  assert.equal((await send()).status, 200);
+  assert.equal(store.getCreditAccount(account.id).balance, 10_000_000);
+  assert.equal(store.getCreditOrder(account.id, order.orderId).paidAmount, 4000);
+  // A retry must not call Cashi or add credits a second time, even if Cashi is down.
+  fs.writeFileSync(CASHI_FIXTURES, '{}');
+  assert.equal((await send()).status, 200);
+  assert.equal(store.getCreditAccount(account.id).balance, 10_000_000);
+  assert.equal(store.readLedger({ userId: account.id, type: 'purchase' }).length, 1);
+});
+
+test('older remote bots can settle through signed RPC without supplying an amount', async () => {
+  const account = user();
+  const order = store.createCreditOrder(account.id, { kind: 'credits', packageId: 'kredit-10m' });
+  const send = async () => {
+    const body = JSON.stringify({ fn: 'settlePayment', args: [order.orderId, null, 'SETTLED', { source: 'bot_refresh' }] });
+    const timestamp = String(Date.now());
+    return fetch(`${base}/internal/rpc`, {
+      method: 'POST', body,
+      headers: {
+        'content-type': 'application/json',
+        'x-internal-timestamp': timestamp,
+        'x-internal-signature': crypto.createHmac('sha256', INTERNAL_SECRET).update(`${timestamp}.`).update(body).digest('hex'),
+      },
+    });
+  };
+  const setAmount = (amount, status = 'SETTLED') => fs.writeFileSync(CASHI_FIXTURES, JSON.stringify({
+    [`/api/check-status/${order.orderId}`]: { body: { success: true, status, order_id: order.orderId } },
+    [`/api/checkout/${order.orderId}`]: { body: { success: true, data: { order_id: order.orderId, status, total_amount: amount } } },
+  }));
+  setAmount(4000, 'PENDING');
+  assert.equal((await send()).status, 500);
+  assert.equal(store.getCreditAccount(account.id).balance, 0);
+  setAmount(undefined);
+  assert.equal((await (await send()).json()).result.reason, 'amount_missing');
+  assert.equal(store.getCreditAccount(account.id).balance, 0);
+  setAmount(3999);
+  assert.equal((await (await send()).json()).result.reason, 'amount_mismatch');
+  assert.equal(store.getCreditAccount(account.id).balance, 0);
+  setAmount(4000);
+  const results = await Promise.all([send(), send()]);
+  const payloads = await Promise.all(results.map((response) => response.json()));
+  assert.ok(payloads.every((payload) => payload.ok));
+  assert.equal(payloads.filter((payload) => payload.result.settled).length, 1);
+  assert.equal(payloads.filter((payload) => payload.result.alreadySettled).length, 1);
+  assert.equal(store.getCreditOrder(account.id, order.orderId).paymentTestimonial.status, 'pending');
+  assert.equal(store.getCreditAccount(account.id).balance, 10_000_000);
+  assert.equal(store.getCreditOrder(account.id, order.orderId).paidAmount, 4000);
+  assert.equal(store.readLedger({ userId: account.id, type: 'purchase' }).length, 1);
 });
 
 test('unlimited pass: covered model is not charged and limits apply; other models use credits', async () => {
@@ -395,6 +485,33 @@ test('unlimited pass: covered model is not charged and limits apply; other model
     await other.json();
     await waitFor(() => settled(account.id), 'settlement');
     assert.equal(store.getCreditAccount(account.id).balance, 1_000_000 - 2_625);
+  } finally {
+    creditConfig.updateCreditConfig({ op: 'setUnlimitedSale', enabled: false }, ADMIN);
+  }
+});
+
+test('weekly China pass covers only included models, enforces output and 10 RPM without spending credits', async () => {
+  const { buildChinaUnlimitedPlan } = require('../scripts/configure-china-unlimited');
+  for (const change of buildChinaUnlimitedPlan(creditConfig.getCreditCatalog()).changes) creditConfig.updateCreditConfig(change, ADMIN);
+  try {
+    const account = user();
+    const order = store.createCreditOrder(account.id, { kind: 'unlimited', hours: 168 });
+    assert.equal(order.priceIdr, 59000);
+    assert.equal(store.settlePayment(order.orderId, 59000).settled, true);
+    for (let index = 0; index < 10; index += 1) {
+      const response = await call(account, { model: 'hy3', max_tokens: 99999, ...msg('weekly pass') });
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get('x-billing-funding'), 'unlimited');
+      assert.equal(mock.requests.at(-1).body.max_tokens, 8192);
+      await response.json();
+    }
+    const limited = await call(account, { model: 'hy3', ...msg('too many') });
+    assert.equal(limited.status, 429);
+    assert.equal((await limited.json()).error.type, 'unlimited_rate_limit');
+    const outside = await call(account, { model: 'gpt-6-sol', ...msg('not included') });
+    assert.equal(outside.status, 402);
+    assert.equal(store.getCreditAccount(account.id).balance, 0);
+    assert.equal(store.readLedger({ userId: account.id, type: 'usage' }).length, 0);
   } finally {
     creditConfig.updateCreditConfig({ op: 'setUnlimitedSale', enabled: false }, ADMIN);
   }

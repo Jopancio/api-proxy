@@ -16,6 +16,8 @@ const moderation = require('./moderation');
 const creditRules = require('./credit-rules');
 const creditConfig = require('./credit-config');
 const creditStore = require('./credit-store');
+const { getCashiPaymentStatus, hasCashiAmount } = require('./cashi-client');
+const { createPaymentTestimonialWorker } = require('./payment-testimonials');
 
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = Number(process.env.PORT || 8080);
@@ -77,8 +79,20 @@ const app = express();
 // Request logging: method, path, status, response time, response size.
 app.use(morgan('dev'));
 
+// Also used by the signed internal RPC: older bots may send SETTLED without
+// amount, so verification must be available on the API host as well as the bot.
+async function settleCashiPayment(orderId, amount, status = 'SETTLED', meta = {}) {
+  const order = creditStore.getCreditOrder(null, orderId);
+  if (order && order.status !== 'SETTLED' && String(status).toUpperCase() === 'SETTLED' && !hasCashiAmount(amount)) {
+    const payment = await getCashiPaymentStatus(orderId);
+    if (payment.status !== 'SETTLED') throw new Error('Cashi belum mengonfirmasi pembayaran lunas. Silakan coba lagi.');
+    amount = payment.amount;
+  }
+  return creditStore.settlePayment(orderId, amount, status, meta);
+}
+
 // Cashi payment webhook. Cashi signs the exact raw request body with HMAC-SHA256.
-app.post('/webhooks/cashi', express.raw({ type: 'application/json' }), (req, res) => {
+app.post('/webhooks/cashi', express.raw({ type: 'application/json' }), async (req, res, next) => {
   const signature = req.get('x-gateway-signature');
   if (!CASHI_SECRET_KEY || !signature || !Buffer.isBuffer(req.body)) {
     return res.status(401).send('Invalid webhook');
@@ -98,10 +112,18 @@ app.post('/webhooks/cashi', express.raw({ type: 'application/json' }), (req, res
   }
   // Token credit / unlimited orders are credited once, only when the paid amount covers the
   // order price (credit-store.js); every other order id is the old Rupiah top-up.
-  if (event.event === 'PAYMENT_SETTLED' && event.data?.status === 'SETTLED') {
-    const result = creditStore.settlePayment(event.data.order_id, event.data.amount, event.data.status, { source: 'webhook' });
-    if (result && result.settled === false && result.reason) {
-      console.warn(`[cashi] order ${String(event.data.order_id).slice(0, 80)} not credited: ${result.reason}`);
+  if (event?.event === 'PAYMENT_SETTLED' && event.data?.status === 'SETTLED') {
+    try {
+      const orderId = event.data.order_id;
+      const result = await settleCashiPayment(orderId, event.data.amount, event.data.status, { source: 'webhook' });
+      if (result && result.settled === false && result.reason) {
+        console.warn(`[cashi] order ${String(orderId).slice(0, 80)} not credited: ${result.reason}`);
+        if (result.reason === 'amount_missing') return res.status(503).send('Payment amount not available yet; retry');
+      }
+    } catch (error) {
+      if (isDbBusy(error)) return next(error);
+      console.error('[cashi] Could not verify webhook payment:', error.message);
+      return res.status(502).send('Could not verify payment; retry');
     }
   }
   return res.send('OK');
@@ -189,7 +211,7 @@ const INTERNAL_FUNCTIONS = {
   getCreditOrder: creditStore.getCreditOrder,
   createCreditOrder: creditStore.createCreditOrder,
   markCreditOrderFailed: creditStore.markCreditOrderFailed,
-  settlePayment: creditStore.settlePayment,
+  settlePayment: settleCashiPayment,
   adminConfirmCreditOrder: creditStore.adminConfirmCreditOrder,
   adjustCredits: creditStore.adjustCredits,
   refundCredits: creditStore.refundCredits,
@@ -216,7 +238,7 @@ function validInternalSignature(req) {
   return provided.length === expectedBuffer.length && crypto.timingSafeEqual(provided, expectedBuffer);
 }
 
-app.post('/internal/rpc', express.raw({ type: '*/*', limit: '1mb' }), (req, res) => {
+app.post('/internal/rpc', express.raw({ type: '*/*', limit: '1mb' }), async (req, res) => {
   if (!INTERNAL_API_SECRET) return res.status(404).json({ ok: false, error: 'Internal API disabled' });
   if (!Buffer.isBuffer(req.body) || !validInternalSignature(req)) return res.status(401).json({ ok: false, error: 'Invalid signature' });
   let call;
@@ -232,7 +254,7 @@ app.post('/internal/rpc', express.raw({ type: '*/*', limit: '1mb' }), (req, res)
   }
   if (!fn || !Array.isArray(call.args)) return res.status(400).json({ ok: false, error: 'Unknown function' });
   try {
-    const result = fn(...call.args);
+    const result = await fn(...call.args);
     return res.json({ ok: true, result: result === undefined ? null : result });
   } catch (error) {
     console.error(`[internal] ${call.fn} failed:`, error.message);
@@ -1406,6 +1428,11 @@ app.use((error, req, res, next) => {
 
 app.listen(PORT, HOST, () => {
   console.log(`OpenAI-compatible API proxy listening on http://${HOST}:${PORT}`);
+  createPaymentTestimonialWorker({ sources: [creditStore, usageDb].map(store => ({
+    list: store.listPendingPaymentTestimonials,
+    claim: store.claimPaymentTestimonial,
+    complete: store.completePaymentTestimonial,
+  })) }).start();
   // Internal addresses of this container/host, for DATA_API_URL on a bot running on the same node.
   const internal = Object.values(require('os').networkInterfaces()).flat()
     .filter((entry) => entry && entry.family === 'IPv4' && !entry.internal)

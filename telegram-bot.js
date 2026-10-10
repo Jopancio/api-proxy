@@ -2,6 +2,7 @@ require('dotenv').config();
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 // All data calls are async: they hit local files or, when the bot runs on a
 // different host than server.js, the API server's internal data endpoint.
 const {
@@ -26,6 +27,7 @@ const {
 const { DEFAULT_MODEL_PRICE, PINNED_MODELS, getModelFamily, getModelPrice, stripModelPrefix, tokenAllowance } = require('./pricing');
 // Pure helpers only (parsing admin commands, credit math for estimates); no data access.
 const creditRules = require('./credit-rules');
+const { getCashiPaymentStatus } = require('./cashi-client');
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const UPSTREAM_BASE_URL = process.env.UPSTREAM_BASE_URL || 'https://sg1-9682fffda636.shinsengumi.my.id/v1';
@@ -38,8 +40,15 @@ const ADMIN_TELEGRAM_ID = String(process.env.ADMIN_TELEGRAM_ID || '6957236291').
 const STORE_NAME = process.env.STORE_NAME || 'X Store';
 const PAYMENTS_OFF_MESSAGE = '\u{1F6A7} <b>Pembelian paket token sedang ditutup sementara.</b>\n\nPembayaran belum bisa dilakukan saat ini. Silakan coba lagi nanti, atau gunakan <b>Redeem Code</b> kalau kamu punya kode. \u{1F39F}\u{FE0F}';
 const PAYMENTS_OFF_ADMIN_HINT = '\n\n<i>Admin: buka lewat Admin Panel \u{2192} \u{1F513} Enable Payments.</i>';
-// One label for every entry point to the credit packages (menu, dashboard, Kredit Token screen).
+// One label for every entry point to the credit packages (dashboard, Kredit Token screen).
 const BUY_CREDITS_BUTTON = '\u{1F6D2} Beli Paket Token';
+const REQUIRED_GROUPS = [
+  { chatId: '@galaxy_hub_api', name: 'Galaxy Hub API', url: 'https://t.me/galaxy_hub_api' },
+  { chatId: '@galaxy_testi', name: 'Galaxy Testi', url: 'https://t.me/galaxy_testi' },
+];
+const GROUP_VERIFY_ACTION = 'group_verify';
+let membershipBroadcastDraft = null;
+let membershipBroadcastStats = null;
 const pendingAdminActions = new Set();
 const pendingAdminTopups = new Map();
 // Admin redeem-code wizard: { step: 'amount' } or { step: 'uses', amount }.
@@ -75,6 +84,8 @@ const pollDrafts = new Map();
 // Admin typing credit commands (Admin Panel -> Kredit & Paket): { mode: 'console' } or
 // { mode: 'user', targetId } for one user's credit adjustment.
 const pendingAdminCredit = new Map();
+// Keep the admin's multiplier search/page when returning from a model editor.
+const adminMultiplierLists = new Map();
 const MAX_REFERRAL_REWARD = 1_000_000_000;
 const MAX_REFERRAL_CAP = 100_000;
 // Set from getMe at startup; used to build t.me/<bot>?start=<code> referral links.
@@ -131,6 +142,7 @@ async function telegram(method, payload = {}) {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(payload),
+    ...(method === 'getChatMember' ? { signal: AbortSignal.timeout(10_000) } : {}),
   });
   const result = await response.json();
   if (!response.ok || !result.ok) {
@@ -218,7 +230,6 @@ function card(title, lines) {
 
 function menuKeyboard(userId = '') {
   const rows = [
-    [{ text: '\u{1F48E} Kredit Token', callback_data: 'credits' }, { text: BUY_CREDITS_BUTTON, callback_data: 'top_up' }],
     [{ text: '\u{1F4CA} API Dashboard', callback_data: 'dashboard' }, { text: '\u{1F9FE} Logs', callback_data: 'logs' }],
     [{ text: '\u{1F39F}\u{FE0F} Redeem Code', callback_data: 'redeem' }, { text: '\u{1F91D} Referral', callback_data: 'referral' }],
     [{ text: '\u{1F3AB} Create a Ticket', callback_data: 'ticket' }],
@@ -230,6 +241,7 @@ function menuKeyboard(userId = '') {
 function dashboardKeyboard() {
   return { inline_keyboard: [
     [{ text: '\u{1F48E} Kredit Token', callback_data: 'credits' }, { text: BUY_CREDITS_BUTTON, callback_data: 'top_up' }],
+    [{ text: '\u{267E}\u{FE0F} Unlimited Model China', callback_data: 'cr_ul' }],
     [{ text: '\u{1F4CB} Model & Multiplier', callback_data: 'cr_models' }, { text: '\u{1F9FE} Logs', callback_data: 'logs' }],
     [{ text: '\u{1F4C8} Usage Summary', callback_data: 'usage' }],
     [{ text: '\u{1F511} Create new API key', callback_data: 'create_key' }, { text: '\u{1F5D1}\u{FE0F} Revoke API Key', callback_data: 'revoke' }],
@@ -316,7 +328,9 @@ async function adminKeyboard() {
     // Balance & codes
     [{ text: '\u{1F39F}\u{FE0F} Redeem Codes', callback_data: 'admin_redeem' }, { text: '\u{1F464} Users & Top Up', callback_data: 'admin_topup' }],
     [{ text: '\u{1F510} Kode Akses Model', callback_data: 'admin_mac' }, { text: '\u{1F48E} Kredit & Paket', callback_data: 'admin_cr' }],
+    [{ text: '\u{2716}\u{FE0F} Atur Multiplier', callback_data: 'admin_cr_rates' }],
     // Settings & broadcast
+    [{ text: '\u{1F465} Verifikasi Semua User', callback_data: 'admin_groups' }],
     [
       { text: await isAllModelsFree() ? '\u{1F534} Disable Free Mode' : '\u{1F7E2} Free Mode', callback_data: 'admin_free_toggle' },
       { text: '\u{1F4E2} Announcement', callback_data: 'admin_announce' },
@@ -1226,12 +1240,13 @@ function revokeKeyboard(user) {
   return { inline_keyboard: rows };
 }
 
-// Asks Cashi for a QR payment. Throws when Cashi refuses (then no payment can exist).
+// Explicitly select QRIS Custom; omitting kode_channel uses Cashi's default QRIS.
+// Throws when Cashi refuses; never retry through the default channel.
 async function cashiCreatePayment(orderId, amount) {
   const response = await fetch(CASHI_API_URL, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-api-key': CASHI_API_KEY },
-    body: JSON.stringify({ amount, order_id: orderId }),
+    body: JSON.stringify({ amount, order_id: orderId, kode_channel: 'qris_custom' }),
   });
   const result = await response.json();
   if (!response.ok || !result.success) throw new Error(result.message || `Cashi returned ${response.status}`);
@@ -1308,7 +1323,7 @@ async function startCreditPurchase(chatId, telegramId, request) {
   }
   const what = order.kind === 'credits'
     ? `Paket: <b>${bigNumber(order.credits)} kredit token</b>`
-    : `Paket: <b>${escapeHtml(order.name || 'Unlimited')} ${formatTokens(order.hours)} jam</b>`;
+    : `Paket: <b>${escapeHtml(order.name || 'Unlimited')} ${unlimitedDurationLabel(order.hours)}</b>`;
   const caption = [
     '\u{2705} <b>QR pembayaran siap</b>',
     '',
@@ -1337,7 +1352,7 @@ async function startCreditPurchase(chatId, telegramId, request) {
 
 const PAYMENT_PROBLEMS = {
   amount_mismatch: '\u{26A0}\u{FE0F} Jumlah yang dibayar tidak sesuai harga paket, jadi kredit belum ditambahkan. Hubungi admin lewat ticket dengan menyertakan nomor order.',
-  amount_missing: '\u{23F3} Pembayaran tercatat lunas, tapi jumlahnya belum bisa diverifikasi. Admin akan memeriksa; hubungi admin lewat ticket bila perlu.',
+  amount_missing: '\u{23F3} Pembayaran tercatat lunas, tetapi nominal belum tersedia dari Cashi. Tekan Refresh status untuk mencoba lagi, atau hubungi admin lewat ticket.',
 };
 
 async function refreshCashiStatus(chatId, telegramId, orderId) {
@@ -1353,10 +1368,8 @@ async function refreshCashiStatus(chatId, telegramId, orderId) {
   }
   const refreshMarkup = { inline_keyboard: [[{ text: '\u{1F504} Refresh status', callback_data: `status_${orderId}` }], [{ text: '\u{1F519} Back to menu', callback_data: 'menu' }]] };
   try {
-    const response = await fetch(`https://cashi.id/api/check-status/${encodeURIComponent(orderId)}`, { headers: { 'x-api-key': CASHI_API_KEY } });
-    const result = await response.json();
-    if (!response.ok || !result.success) throw new Error(result.message || `Cashi returned ${response.status}`);
-    const status = String(result.status || 'UNKNOWN').toUpperCase();
+    const result = await getCashiPaymentStatus(orderId);
+    const status = result.status;
     if (creditOrder) {
       if (status !== 'SETTLED' && creditOrder.status !== 'SETTLED') {
         await telegram('sendMessage', { chat_id: chatId, text: `\u{23F3} <b>Status pembayaran: ${escapeHtml(status)}</b>\n\nOrder: <code>${escapeHtml(orderId)}</code>\nSelesaikan pembayaran QR, lalu tekan Refresh lagi.`, parse_mode: 'HTML', reply_markup: refreshMarkup });
@@ -1365,15 +1378,19 @@ async function refreshCashiStatus(chatId, telegramId, orderId) {
       // Verified with Cashi just now (status and amount of THIS order id); credited at most once.
       const settled = creditOrder.status === 'SETTLED' ? { alreadySettled: true } : await settlePayment(orderId, result.amount, status, { source: 'bot_refresh' });
       if (settled?.reason && PAYMENT_PROBLEMS[settled.reason]) {
-        await telegram('sendMessage', { chat_id: chatId, text: `${PAYMENT_PROBLEMS[settled.reason]}\n\nOrder: <code>${escapeHtml(orderId)}</code>`, parse_mode: 'HTML', reply_markup: menuKeyboard(telegramId) });
+        const amount = result.amount === undefined ? 'Belum tersedia' : rupiah(result.amount);
+        await telegram('sendMessage', { chat_id: chatId, text: `${PAYMENT_PROBLEMS[settled.reason]}\n\nHarga paket: <b>${rupiah(creditOrder.priceIdr)}</b>\nJumlah dari Cashi: <b>${amount}</b>\nOrder: <code>${escapeHtml(orderId)}</code>`, parse_mode: 'HTML', reply_markup: { inline_keyboard: [refreshMarkup.inline_keyboard[0], [{ text: '\u{1F3AB} Create a Ticket', callback_data: 'ticket' }], refreshMarkup.inline_keyboard[1]] } });
         return;
       }
+      if (!settled?.settled && !settled?.alreadySettled) throw new Error('Pembayaran belum berhasil diverifikasi. Silakan Refresh status lagi.');
       const overview = await getCreditOverview(telegramId).catch(() => null);
-      const pass = overview?.passes?.active?.[0] || overview?.passes?.scheduled?.[0];
+      const pass = settled.pass || [...(overview?.passes?.active || []), ...(overview?.passes?.scheduled || [])].find(item => item.orderId === orderId);
+      const scheduled = pass && Date.parse(pass.startsAt) > Date.now();
       const lines = creditOrder.kind === 'credits'
         ? [`\u{2705} <b>Pembayaran terverifikasi!</b>`, '', `+<b>${bigNumber(creditOrder.credits)}</b> kredit token`, `Saldo kredit: <b>${bigNumber(overview?.account.available ?? 0)}</b>`]
-        : [`\u{2705} <b>Paket unlimited aktif!</b>`, '', pass ? `Berlaku: <b>${escapeHtml(wibTime(pass.startsAt))}</b> s/d <b>${escapeHtml(wibTime(pass.endsAt))}</b>` : ''];
-      await telegram('sendMessage', { chat_id: chatId, text: [...lines, `Order: <code>${escapeHtml(orderId)}</code>`].filter(Boolean).join('\n'), parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '\u{1F48E} Kredit Token', callback_data: 'credits' }], [{ text: '\u{1F519} Back to menu', callback_data: 'menu' }]] } });
+        : [`\u{2705} <b>Paket unlimited ${scheduled ? 'terjadwal' : 'aktif'}!</b>`, '', pass ? `Berlaku: <b>${escapeHtml(wibTime(pass.startsAt))}</b> s/d <b>${escapeHtml(wibTime(pass.endsAt))}</b>` : ''];
+      const paidAmount = creditOrder.paidAmount ?? result.amount;
+      await telegram('sendMessage', { chat_id: chatId, text: [...lines, paidAmount !== undefined ? `Jumlah dibayar: <b>${rupiah(paidAmount)}</b>` : '', `Order: <code>${escapeHtml(orderId)}</code>`].filter(Boolean).join('\n'), parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '\u{1F48E} Kredit Token', callback_data: 'credits' }], [{ text: '\u{1F519} Back to menu', callback_data: 'menu' }]] } });
       return;
     }
     if (status === 'SETTLED') await settleOrder(orderId, result.amount);
@@ -1389,7 +1406,7 @@ async function refreshCashiStatus(chatId, telegramId, orderId) {
     });
   } catch (error) {
     console.error('[cashi status]', error.message);
-    await telegram('sendMessage', { chat_id: chatId, text: `\u{274C} Could not check payment status: ${escapeHtml(error.message)}`, parse_mode: 'HTML' });
+    await telegram('sendMessage', { chat_id: chatId, text: `\u{274C} Could not check payment status: ${escapeHtml(error.message)}\n\nOrder: <code>${escapeHtml(orderId)}</code>`, parse_mode: 'HTML', reply_markup: refreshMarkup });
   }
 }
 
@@ -1420,6 +1437,10 @@ function creditBackRow() {
 function shortTime(iso) {
   const time = wibLogTime(iso);
   return /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(time) ? `${time.slice(8, 10)}/${time.slice(5, 7)} ${time.slice(11, 16)}` : time;
+}
+
+function unlimitedDurationLabel(hours) {
+  return Number(hours) >= 24 && Number(hours) % 24 === 0 ? `${formatTokens(Number(hours) / 24)} hari` : `${formatTokens(hours)} jam`;
 }
 
 function unlimitedTerms(source) {
@@ -1565,7 +1586,7 @@ function ledgerLine(entry) {
   }
   if (entry.type === 'refund') return `\u{21A9}\u{FE0F} ${when} \u{2022} Refund <b>${signed(entry.credits)}</b>${entry.reason ? ` \u{2014} ${escapeHtml(entry.reason)}` : ''}`;
   if (entry.type === 'adjustment') return `\u{1F6E0}\u{FE0F} ${when} \u{2022} Penyesuaian admin <b>${signed(entry.credits)}</b>${entry.reason ? ` \u{2014} ${escapeHtml(entry.reason)}` : ''}`;
-  if (entry.type === 'unlimited_purchase') return `\u{267E}\u{FE0F} ${when} \u{2022} Paket unlimited ${formatTokens(entry.hours)} jam (${rupiah(entry.priceIdr)})\n   ${escapeHtml(shortTime(entry.startsAt))} \u{2192} ${escapeHtml(shortTime(entry.endsAt))}`;
+  if (entry.type === 'unlimited_purchase') return `\u{267E}\u{FE0F} ${when} \u{2022} Paket unlimited ${unlimitedDurationLabel(entry.hours)} (${rupiah(entry.priceIdr)})\n   ${escapeHtml(shortTime(entry.startsAt))} \u{2192} ${escapeHtml(shortTime(entry.endsAt))}`;
   return `${when} \u{2022} ${escapeHtml(entry.type)}`;
 }
 
@@ -1602,13 +1623,13 @@ async function creditUnlimitedView(telegramId) {
   if (!unlimited.saleEnabled || !forSale.length) {
     lines.push('Penjualan paket unlimited <b>belum dibuka</b>: harga belum ditetapkan admin.');
   } else {
-    lines.push('<b>Harga</b>', ...unlimited.durations.map((item) => `\u{2022} ${formatTokens(item.hours)} jam: ${item.active && item.priceIdr !== null ? `<b>${rupiah(item.priceIdr)}</b>` : '<i>belum dijual</i>'}`));
+    lines.push('<b>Pilih durasi</b>', ...forSale.map((item) => `\u{2022} ${unlimitedDurationLabel(item.hours)}: <b>${rupiah(item.priceIdr)}</b>`));
   }
   lines.push('', card('<b>Ketentuan</b>', [
     ...unlimitedTerms(unlimited),
     'Waktu dihitung sejak pembayaran terverifikasi; beli lagi saat aktif = mulai setelah paket sekarang berakhir',
   ]));
-  const rows = unlimited.saleEnabled ? forSale.map((item) => [{ text: `\u{267E}\u{FE0F} ${formatTokens(item.hours)} jam \u{2022} ${rupiah(item.priceIdr)}`, callback_data: `ulbuy_${item.hours}` }]) : [];
+  const rows = unlimited.saleEnabled ? forSale.map((item) => [{ text: `\u{267E}\u{FE0F} ${unlimitedDurationLabel(item.hours)} \u{2022} ${rupiah(item.priceIdr)}`, callback_data: `ulbuy_${item.hours}` }]) : [];
   rows.push(creditBackRow());
   return { text: lines.join('\n'), reply_markup: { inline_keyboard: rows } };
 }
@@ -1663,43 +1684,111 @@ async function adminCreditView(notice = '') {
       `Aktif: <b>${formatTokens(listed.length - pendingModels.length)}</b> \u{2022} menunggu konfigurasi: <b>${formatTokens(pendingModels.length)}</b>`,
       pendingModels.length && pendingModels.slice(0, 12).map((entry) => `<code>${escapeHtml(entry.model)}</code>`).join(', '),
     ]),
-    '<i>Semua perubahan memakai perintah teks (tombol Ketik perintah), diautentikasi dan dicatat di Audit.</i>',
+    '<i>Ubah multiplier langsung lewat tombol Multiplier. Pengaturan lainnya lewat Ketik perintah. Semua perubahan dicatat di Audit.</i>',
   ];
   return { text: lines.join('\n'), reply_markup: adminCreditKeyboard() };
 }
 
-async function adminCreditRatesView() {
-  const [admin, catalog] = await Promise.all([getCreditAdmin(), getCreditCatalog()]);
-  const { rates } = admin.config;
-  const describe = (entry) => {
-    const rate = rates[entry.model];
-    if (entry.status === 'active') {
-      const parts = [multiplierText(entry.multiplier)];
-      if (entry.split) parts.push(`(in ${multiplierText(creditRules.formatMultiplier(entry.units.input))} cache ${multiplierText(creditRules.formatMultiplier(entry.units.cachedInput))} out ${multiplierText(creditRules.formatMultiplier(entry.units.output))})`);
-      if (entry.routedTo) parts.push(`route ${escapeHtml(entry.provider)}\u{2192}${escapeHtml(entry.routedTo)}`);
-      else if (entry.alias) parts.push(`alias\u{2192}${escapeHtml(entry.rateModel)}`);
-      if (entry.toolCallCredits) parts.push(`tool ${formatTokens(entry.toolCallCredits)}`);
-      return parts.join(' ');
-    }
-    if (rate?.status === 'alias') {
-      const efforts = Object.entries(rate.effortTargets || {}).map(([effort, target]) => `${effort}\u{2192}${target}`).join(', ');
-      return `\u{23F3} alias\u{2192}${escapeHtml(rate.target || '?')}${efforts ? ` [${escapeHtml(efforts)}]` : ''}${rate.requiresToolPrice ? ` tool ${rate.toolCallCredits === null ? '?' : formatTokens(rate.toolCallCredits)}` : ''}`;
-    }
-    return `\u{23F3} ${escapeHtml(entry.reason || 'menunggu konfigurasi')}`;
+const MULTIPLIER_PAGE_SIZE = 10;
+const MULTIPLIER_PRESETS = ['0.5', '1', '1.25', '1.5', '1.75', '2', '2.5', '3'];
+
+// Stable short IDs fit Telegram's 64-byte callback limit, even for long names.
+function multiplierModelId(model) {
+  return crypto.createHash('sha256').update(model).digest('hex').slice(0, 12);
+}
+
+async function adminCreditRatesView(adminId, page = 0, search) {
+  const catalog = await getCreditCatalog();
+  const query = search === undefined ? (adminMultiplierLists.get(adminId)?.search || '') : String(search).trim().slice(0, 80);
+  const models = catalog.models.filter((entry) => entry.model.toLowerCase().includes(query.toLowerCase()))
+    .sort((a, b) => Number(b.listed) - Number(a.listed) || a.model.localeCompare(b.model));
+  const pages = Math.max(1, Math.ceil(models.length / MULTIPLIER_PAGE_SIZE));
+  const currentPage = Math.max(0, Math.min(Number(page) || 0, pages - 1));
+  adminMultiplierLists.set(adminId, { search: query, page: currentPage });
+  const visible = models.slice(currentPage * MULTIPLIER_PAGE_SIZE, (currentPage + 1) * MULTIPLIER_PAGE_SIZE);
+  const rows = visible.map((entry) => [{
+    text: `${entry.status === 'active' ? multiplierText(entry.multiplier) : '\u{23F3}'} ${entry.model}${entry.listed ? '' : ' (tersimpan)'}`,
+    callback_data: `admin_cr_rate_${multiplierModelId(entry.model)}`,
+  }]);
+  const navigation = [];
+  if (currentPage > 0) navigation.push({ text: '\u{2B05}\u{FE0F} Sebelumnya', callback_data: `admin_cr_rates_page_${currentPage - 1}` });
+  if (currentPage + 1 < pages) navigation.push({ text: 'Berikutnya \u{27A1}\u{FE0F}', callback_data: `admin_cr_rates_page_${currentPage + 1}` });
+  if (navigation.length) rows.push(navigation);
+  rows.push([{ text: '\u{1F50E} Cari model', callback_data: 'admin_cr_rates_search' }, { text: '\u{1F4CB} Semua model', callback_data: 'admin_cr_rates' }]);
+  rows.push([{ text: '\u{1F519} Admin panel', callback_data: 'admin_panel' }, { text: '\u{1F48E} Kredit & Paket', callback_data: 'admin_cr' }]);
+  return {
+    text: [
+      '\u{2716}\u{FE0F} <b>MULTIPLIER MODEL</b>',
+      'Pilih model, lalu tekan nilai multiplier atau masukkan angka sendiri. Perubahan langsung berlaku untuk request baru.',
+      query ? `Pencarian: <b>${escapeHtml(query)}</b>` : '',
+      `${models.length} model \u{2022} halaman ${currentPage + 1}/${pages}`,
+      models.length ? '\u{23F3} = belum siap digunakan. Model tersimpan tetap bisa diatur meskipun tidak ada di daftar upstream.' : 'Tidak ada model yang cocok. Coba kata pencarian lain.',
+    ].filter(Boolean).join('\n\n'),
+    reply_markup: { inline_keyboard: rows },
   };
-  const sections = MODEL_FAMILIES.map((family) => {
-    const list = catalog.models.filter((entry) => entry.family === family);
-    if (!list.length) return '';
-    return `<b>${family}</b>\n${list.map((entry) => `\u{2022} <code>${escapeHtml(entry.model)}</code>${entry.listed ? '' : ' <i>(tidak di upstream)</i>'} ${describe(entry)}`).join('\n')}`;
-  }).filter(Boolean);
-  let text = [
-    '\u{2716}\u{FE0F} <b>MULTIPLIER MODEL</b>',
-    '<i>Tarif jual, bukan harga resmi provider. Ubah: </i><code>tarif &lt;model&gt; &lt;multiplier&gt;</code>',
-    '',
-    sections.join('\n\n'),
-  ].join('\n');
-  if (text.length > 4000) text = `${text.slice(0, 3980)}\n\u{2026}`;
-  return { text, reply_markup: adminCreditSubKeyboard() };
+}
+
+async function loadMultiplierModel(key) {
+  const [admin, catalog] = await Promise.all([getCreditAdmin(), getCreditCatalog()]);
+  if (admin.config.version !== catalog.version) throw new Error('Konfigurasi sedang berubah. Buka model ini lagi.');
+  const matches = catalog.models.filter((entry) => multiplierModelId(entry.model) === key);
+  if (matches.length !== 1) throw new Error('Model tidak ditemukan. Buka daftar model lagi.');
+  const entry = matches[0];
+  const config = admin.config;
+  let target = config.routing?.[entry.provider]?.[entry.model] || entry.model;
+  const visited = new Set();
+  // Follow the default alias target without replacing its mapping or tool price.
+  while (config.rates[target]?.status === 'alias') {
+    if (visited.has(target) || visited.size >= 6 || !config.rates[target].target) {
+      target = null;
+      break;
+    }
+    visited.add(target);
+    target = config.rates[target].target;
+  }
+  return { key, entry, config, target, rate: target ? config.rates[target] : null };
+}
+
+async function adminMultiplierModelView(key, notice = '', loaded) {
+  const { entry, config, target, rate } = loaded || await loadMultiplierModel(key);
+  const rows = [];
+  if (target) {
+    for (let index = 0; index < MULTIPLIER_PRESETS.length; index += 4) {
+      rows.push(MULTIPLIER_PRESETS.slice(index, index + 4).map((value) => ({
+        text: multiplierText(value), callback_data: `admin_cr_rate_set_${key}_${config.version}_${value}`,
+      })));
+    }
+    rows.push([{ text: '\u{2328}\u{FE0F} Masukkan nilai sendiri', callback_data: `admin_cr_rate_custom_${key}_${config.version}` }]);
+  } else {
+    rows.push([{ text: '\u{1F500} Atur routing & alias', callback_data: 'admin_cr_routing' }]);
+  }
+  rows.push([{ text: '\u{1F519} Daftar model', callback_data: 'admin_cr_rates_back' }, { text: '\u{1F504} Refresh', callback_data: `admin_cr_rate_${key}` }]);
+  const split = rate?.status === 'active' && (rate.input || rate.cachedInput || rate.output);
+  return {
+    text: [
+      notice,
+      '\u{2716}\u{FE0F} <b>ATUR MULTIPLIER</b>',
+      `Model: <code>${escapeHtml(entry.model)}</code>`,
+      target && target !== entry.model ? `Tarif mengikuti: <code>${escapeHtml(target)}</code>\nPerubahan juga berlaku untuk model lain yang memakai tarif tujuan ini.` : '',
+      `Multiplier saat ini: <b>${rate?.status === 'active' ? multiplierText(rate.multiplier) : 'Belum diatur'}</b>`,
+      split ? `Input ${multiplierText(rate.input || rate.multiplier)} \u{2022} cache ${multiplierText(rate.cachedInput || rate.input || rate.multiplier)} \u{2022} output ${multiplierText(rate.output || rate.multiplier)}` : '',
+      entry.status !== 'active' ? `Status: ${escapeHtml(entry.reason || 'menunggu konfigurasi')}` : '',
+      target
+        ? 'Tekan angka untuk langsung menyimpan. Nilai berlaku untuk input, cache, dan output; pengaturan terpisah sebelumnya akan diganti.\nContoh: \u{00D7}1,5 = 1.000 token memakai 1.500 kredit.'
+        : 'Alias ini belum memiliki tujuan yang valid. Atur mapping alias terlebih dahulu.',
+      `<i>Konfigurasi v${config.version}. Setiap perubahan tercatat di Audit.</i>`,
+    ].filter(Boolean).join('\n\n'),
+    reply_markup: { inline_keyboard: rows },
+  };
+}
+
+async function saveAdminMultiplier(adminId, key, version, value) {
+  const loaded = await loadMultiplierModel(key);
+  if (loaded.config.version !== Number(version)) throw new Error('Konfigurasi sudah berubah. Tekan Refresh dan pilih nilai lagi.');
+  if (!loaded.target) throw new Error('Atur mapping alias terlebih dahulu.');
+  const multiplier = creditRules.formatMultiplier(creditRules.parseMultiplier(value));
+  const result = await updateCreditConfig({ op: 'setRate', model: loaded.target, multiplier }, adminId);
+  return adminMultiplierModelView(key, `\u{2705} <b>Multiplier tersimpan: ${multiplierText(multiplier)}</b>\n<code>${escapeHtml(loaded.target)}</code> \u{2022} v${result.version}`);
 }
 
 async function adminCreditRoutingView() {
@@ -1755,7 +1844,7 @@ async function adminCreditUnlimitedView() {
     `\u{267E}\u{FE0F} <b>${escapeHtml(unlimited.name.toUpperCase())}</b> (admin)`,
     DIVIDER,
     `Dijual: <b>${unlimited.saleEnabled ? '\u{1F7E2} ON' : '\u{1F534} OFF'}</b> (<code>unlimited jual on|off</code>)`,
-    card('<b>Durasi &amp; harga</b> (<code>unlimited harga &lt;jam&gt; &lt;harga&gt;</code>, <code>unlimited &lt;jam&gt; on|off</code>)', unlimited.durations.map((item) => `${item.active ? '\u{1F7E2}' : '\u{1F534}'} ${formatTokens(item.hours)} jam: ${item.priceIdr === null ? '<i>harga belum ditetapkan</i>' : rupiah(item.priceIdr)}`)),
+    card('<b>Durasi &amp; harga</b> (<code>unlimited harga &lt;jam&gt; &lt;harga&gt;</code>, <code>unlimited &lt;jam&gt; on|off</code>)', unlimited.durations.map((item) => `${item.active ? '\u{1F7E2}' : '\u{1F534}'} ${unlimitedDurationLabel(item.hours)}: ${item.priceIdr === null ? '<i>harga belum ditetapkan</i>' : rupiah(item.priceIdr)}`)),
     card('<b>Model</b> (<code>unlimited model tambah|hapus &lt;model&gt;</code>)', [unlimited.models.length ? unlimited.models.map((model) => `<code>${escapeHtml(model)}</code>`).join(', ') : '<i>kosong: tidak ada model yang otomatis masuk</i>']),
     card('<b>Batas per user</b> (<code>unlimited batas concurrency|rpm|output &lt;nilai&gt;</code>)', [
       `Request bersamaan: <b>${formatTokens(unlimited.limits.maxConcurrent)}</b>`,
@@ -1769,7 +1858,7 @@ async function adminCreditUnlimitedView() {
 
 async function adminCreditOrdersView() {
   const [pending, recent] = await Promise.all([listCreditOrders({ status: 'PENDING', limit: 10 }), listCreditOrders({ limit: 10 })]);
-  const line = (order) => `${order.status === 'SETTLED' ? '\u{2705}' : order.status === 'FAILED' ? '\u{274C}' : '\u{23F3}'} <code>${escapeHtml(order.orderId)}</code>\n   ${order.kind === 'credits' ? `${bigNumber(order.credits)} kredit` : `unlimited ${formatTokens(order.hours)} jam`} \u{2022} ${rupiah(order.priceIdr)} \u{2022} user <code>${escapeHtml(order.userId)}</code>${order.lastRejectedAt ? ` \u{2022} \u{26A0}\u{FE0F} ditolak (dibayar ${order.lastRejectedAmount ?? '?'})` : ''}`;
+  const line = (order) => `${order.status === 'SETTLED' ? '\u{2705}' : order.status === 'FAILED' ? '\u{274C}' : '\u{23F3}'} <code>${escapeHtml(order.orderId)}</code>\n   ${order.kind === 'credits' ? `${bigNumber(order.credits)} kredit` : `unlimited ${unlimitedDurationLabel(order.hours)}`} \u{2022} ${rupiah(order.priceIdr)} \u{2022} user <code>${escapeHtml(order.userId)}</code>${order.lastRejectedAt ? ` \u{2022} \u{26A0}\u{FE0F} ditolak (dibayar ${order.lastRejectedAmount ?? '?'})` : ''}`;
   const lines = [
     '\u{1F9FE} <b>ORDER KREDIT</b>',
     DIVIDER,
@@ -1843,6 +1932,21 @@ async function runAdminCreditCommand(adminId, parsed, line) {
 
 async function handleAdminCreditInput(chatId, adminId, text) {
   const pending = pendingAdminCredit.get(adminId) || { mode: 'console' };
+  if (pending.mode === 'rate_search') {
+    pendingAdminCredit.delete(adminId);
+    const view = await adminCreditRatesView(adminId, 0, text);
+    return telegram('sendMessage', { chat_id: chatId, ...view, parse_mode: 'HTML' });
+  }
+  if (pending.mode === 'rate') {
+    let view;
+    try {
+      view = await saveAdminMultiplier(adminId, pending.key, pending.version, text);
+      pendingAdminCredit.delete(adminId);
+    } catch (error) {
+      view = { text: `\u{274C} ${escapeHtml(error.message)}\n\nKirim angka positif, misalnya <code>1,75</code> (maksimal 1000 dan 4 desimal).`, reply_markup: { inline_keyboard: [[{ text: '\u{1F504} Refresh / Batal', callback_data: `admin_cr_rate_${pending.key}` }]] } };
+    }
+    return telegram('sendMessage', { chat_id: chatId, ...view, parse_mode: 'HTML' });
+  }
   const lines = String(text || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean).slice(0, 20);
   const results = [];
   for (const line of lines) {
@@ -1869,7 +1973,6 @@ async function handleAdminCreditInput(chatId, adminId, text) {
 
 const ADMIN_CREDIT_VIEWS = {
   admin_cr: adminCreditView,
-  admin_cr_rates: adminCreditRatesView,
   admin_cr_routing: adminCreditRoutingView,
   admin_cr_limits: adminCreditLimitsView,
   admin_cr_ul: adminCreditUnlimitedView,
@@ -1880,6 +1983,32 @@ const ADMIN_CREDIT_VIEWS = {
 async function handleAdminCreditAction(query, action) {
   const chatId = query.message.chat.id;
   const adminId = String(query.from.id);
+  if (action === 'admin_cr_rates') return showAdminView(query, await adminCreditRatesView(adminId, 0, ''));
+  if (action === 'admin_cr_rates_back') return showAdminView(query, await adminCreditRatesView(adminId, adminMultiplierLists.get(adminId)?.page || 0));
+  const page = action.match(/^admin_cr_rates_page_(\d+)$/);
+  if (page) return showAdminView(query, await adminCreditRatesView(adminId, Number(page[1])));
+  if (action === 'admin_cr_rates_search') {
+    pendingAdminCredit.set(adminId, { mode: 'rate_search' });
+    return telegram('sendMessage', { chat_id: chatId, text: '\u{1F50E} Kirim nama model atau sebagian namanya, misalnya <code>glm</code> atau <code>deepseek</code>.', parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '\u{1F519} Batal', callback_data: 'admin_cr_rates_back' }]] } });
+  }
+  const model = action.match(/^admin_cr_rate_([a-f0-9]{12})$/);
+  if (model) return showAdminView(query, await adminMultiplierModelView(model[1]));
+  const custom = action.match(/^admin_cr_rate_custom_([a-f0-9]{12})_(\d+)$/);
+  if (custom) {
+    const loaded = await loadMultiplierModel(custom[1]);
+    if (!loaded.target || loaded.config.version !== Number(custom[2])) return showAdminView(query, await adminMultiplierModelView(custom[1], 'Konfigurasi berubah. Pilih lagi dari nilai terbaru.', loaded));
+    pendingAdminCredit.set(adminId, { mode: 'rate', key: custom[1], version: Number(custom[2]) });
+    return telegram('sendMessage', { chat_id: chatId, text: `\u{2328}\u{FE0F} Kirim multiplier baru untuk <code>${escapeHtml(loaded.target)}</code>.\nContoh: <code>1,75</code> atau <code>2</code>.\nHarus lebih dari 0, maksimal 1000, hingga 4 desimal. Nilai berlaku untuk input, cache, dan output.`, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '\u{1F519} Batal', callback_data: `admin_cr_rate_${custom[1]}` }]] } });
+  }
+  const preset = action.match(/^admin_cr_rate_set_([a-f0-9]{12})_(\d+)_(\d+(?:\.\d+)?)$/);
+  if (preset) {
+    try {
+      if (!MULTIPLIER_PRESETS.includes(preset[3])) throw new Error('Pilihan multiplier tidak valid.');
+      return showAdminView(query, await saveAdminMultiplier(adminId, preset[1], preset[2], preset[3]));
+    } catch (error) {
+      return showAdminView(query, await adminMultiplierModelView(preset[1], `\u{274C} ${escapeHtml(error.message)}`));
+    }
+  }
   if (action === 'admin_cr_cmd') {
     pendingAdminCredit.set(adminId, { mode: 'console' });
     return telegram('sendMessage', { chat_id: chatId, text: adminCreditHelpText(), parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '\u{1F519} Kredit & Paket', callback_data: 'admin_cr' }]] } });
@@ -4164,6 +4293,9 @@ async function handleCallbackQuery(query) {
   if (action.startsWith('admin_') && !isAdmin(userId)) {
     return telegram('sendMessage', { chat_id: chatId, text: 'Access denied.' });
   }
+  if (action === 'admin_groups' || action === 'admin_group_prepare' || action.startsWith('admin_group_send_')) {
+    return handleAdminGroupAction(query, action);
+  }
 
   if (action === 'ticket') return startUserTicket(chatId, userId);
   if (action === 'admin_models' || action === 'admin_models_sync') {
@@ -4702,6 +4834,9 @@ async function handleMessage(message) {
     account = await ensureUser(user.id || message.chat.id, profile);
   }
   const text = message.text.trim();
+  if (text.startsWith('/') && ['rate', 'rate_search'].includes(pendingAdminCredit.get(userId)?.mode)) {
+    pendingAdminCredit.delete(userId);
+  }
   if (isAdmin(userId) && pendingAdminCredit.has(userId) && !text.startsWith('/')) {
     try {
       await handleAdminCreditInput(message.chat.id, userId, text);
@@ -5000,13 +5135,176 @@ async function registerBotCommands() {
   await ensureAdminCommands();
 }
 
+function isRequiredGroupMember(member) {
+  return ['creator', 'administrator', 'member'].includes(member?.status)
+    || (member?.status === 'restricted' && member.is_member === true);
+}
+
+async function checkRequiredGroupAccess(bot) {
+  await Promise.all(REQUIRED_GROUPS.map(async group => {
+    try {
+      const member = await telegram('getChatMember', { chat_id: group.chatId, user_id: bot.id });
+      if (!['administrator', 'creator'].includes(member?.status)) throw new Error('bot belum menjadi admin grup');
+      console.log(`[membership] Ready: bot is admin in ${group.chatId}`);
+    } catch (error) {
+      console.error(`[membership] Jadikan bot admin di ${group.chatId} agar verifikasi anggota bisa berjalan: ${error.message}`);
+    }
+  }));
+}
+
+function requiredGroupButtons() {
+  return REQUIRED_GROUPS.map(group => [{ text: `\u{1F465} Join ${group.name}`, url: group.url }]);
+}
+
+function groupJoinView(referralCode = '', checks = []) {
+  return {
+    text: [
+      '\u{1F512} <b>Gabung ke kedua grup dulu, yuk!</b>', '',
+      'Sebelum melanjutkan, join ke kedua grup berikut untuk mengakses semua fitur bot:',
+      ...REQUIRED_GROUPS.map(group => {
+        const check = checks.find(item => item.chatId === group.chatId);
+        const state = check ? (check.unavailable ? 'belum bisa diperiksa' : check.joined ? 'sudah bergabung' : 'belum bergabung') : '';
+        return `\u{2022} <b>${group.name}</b>${state ? `: ${state}` : ''}`;
+      }), '',
+      'Tekan tombol grup di bawah untuk bergabung, lalu tekan <b>Verifikasi Ulang</b>.',
+      ...(checks.some(check => check.unavailable) ? ['', '\u{26A0}\u{FE0F} Keanggotaan belum bisa diperiksa saat ini. Silakan coba Verifikasi Ulang beberapa saat lagi.'] : []),
+    ].join('\n'),
+    reply_markup: { inline_keyboard: [
+      ...requiredGroupButtons(),
+      [{ text: '\u{1F504} Verifikasi Ulang', callback_data: GROUP_VERIFY_ACTION + (referralCode ? `:${referralCode}` : '') }],
+    ] },
+  };
+}
+
+async function requiredGroupMembership(userId) {
+  return Promise.all(REQUIRED_GROUPS.map(async group => {
+    try {
+      const member = await telegram('getChatMember', { chat_id: group.chatId, user_id: userId });
+      return { chatId: group.chatId, joined: isRequiredGroupMember(member), unavailable: false };
+    } catch (error) {
+      console.error(`[membership] ${group.chatId}: check failed: ${error.message}`);
+      return { chatId: group.chatId, joined: false, unavailable: true };
+    }
+  }));
+}
+
+function adminGroupView(notice = '') {
+  const running = membershipBroadcastStats && !membershipBroadcastStats.done;
+  return {
+    text: [
+      ...(notice ? [notice, ''] : []),
+      '\u{1F465} <b>VERIFIKASI SEMUA USER</b>', '',
+      'Wajib join <b>kedua grup</b> berlaku untuk semua pengguna lama dan baru.',
+      ...REQUIRED_GROUPS.map(group => `\u{2022} <b>${group.name}</b>`), '',
+      'Semua fitur bot diperiksa saat digunakan. Sudah join satu grup saja belum cukup.',
+      'Kirim pesan verifikasi ke seluruh pengguna terdaftar dengan dua tombol grup dan Verifikasi Ulang.',
+      ...(running ? ['', '\u{23F3} Pengiriman verifikasi sedang berjalan. Lihat pesan progres sebelumnya.'] : []),
+    ].join('\n'),
+    reply_markup: { inline_keyboard: [
+      ...requiredGroupButtons(),
+      ...(!running ? [[{ text: '\u{1F4E8} Verifikasi Semua User', callback_data: 'admin_group_prepare' }]] : []),
+      [{ text: '\u{1F519} Kembali ke Admin Panel', callback_data: 'admin_panel' }],
+    ] },
+  };
+}
+
+async function handleAdminGroupAction(query, action) {
+  // Also enforce this here so future callers cannot accidentally bypass the admin gate.
+  if (!isAdmin(query.from.id)) return null;
+  if (action === 'admin_groups') {
+    membershipBroadcastDraft = null;
+    return showAdminView(query, adminGroupView());
+  }
+  if (membershipBroadcastStats && !membershipBroadcastStats.done) return showAdminView(query, adminGroupView());
+  if (action === 'admin_group_prepare') {
+    const users = await getAllUsers();
+    const token = crypto.randomBytes(6).toString('hex');
+    membershipBroadcastDraft = { token, expiresAt: Date.now() + 10 * 60 * 1000 };
+    const view = groupJoinView();
+    return showAdminView(query, {
+      text: `\u{1F4E8} <b>Kirim verifikasi ke ${formatTokens(users.length)} user?</b>\n\nPesan yang diterima pengguna:\n\n${view.text}`,
+      reply_markup: { inline_keyboard: [
+        ...requiredGroupButtons(),
+        [{ text: '\u{2705} Kirim Verifikasi ke Semua User', callback_data: `admin_group_send_${token}` }],
+        [{ text: '\u{1F519} Batal', callback_data: 'admin_groups' }],
+      ] },
+    });
+  }
+  const token = action.slice('admin_group_send_'.length);
+  if (!membershipBroadcastDraft || membershipBroadcastDraft.token !== token || membershipBroadcastDraft.expiresAt < Date.now()) {
+    return showAdminView(query, adminGroupView('Tombol kirim sudah tidak berlaku. Buka pratinjau baru untuk mengirim verifikasi.'));
+  }
+  // Consume once before awaiting anything: repeated clicks cannot start duplicate jobs.
+  membershipBroadcastDraft = null;
+  membershipBroadcastStats = { done: false };
+  try {
+    const recipients = await getAllUsers();
+    const view = groupJoinView();
+    const title = '\u{1F465} <b>Pengiriman verifikasi grup</b>';
+    await showAdminView(query, { text: `${title}\n\u{23F3} Menyiapkan pengiriman...`, reply_markup: { inline_keyboard: [] } });
+    membershipBroadcastStats = startBroadcast({
+      label: 'group verification', recipients,
+      send: recipient => telegram('sendMessage', {
+        chat_id: recipient.telegramId,
+        text: `\u{1F514} <b>Verifikasi semua user</b>\n\n${view.text}`,
+        parse_mode: 'HTML', reply_markup: view.reply_markup,
+      }),
+      report: stats => editStatusMessage(query.message.chat.id, query.message.message_id, broadcastStatusText(title, stats), {
+        inline_keyboard: stats.done ? [[{ text: '\u{1F519} Verifikasi Grup', callback_data: 'admin_groups' }]] : [],
+      }),
+    });
+  } catch (error) {
+    membershipBroadcastStats = null;
+    return showAdminView(query, adminGroupView(`\u{274C} Pengiriman belum dimulai: ${escapeHtml(error.message)}`));
+  }
+  return null;
+}
+
+// Gate every incoming private interaction before creating accounts, API keys,
+// referral rewards, payments, tickets or running a previously sent menu button.
+// No membership cache: leaving the group locks the next bot interaction again.
+async function handleBotUpdate(update) {
+  const query = update.callback_query;
+  const message = query?.message || update.message;
+  const from = query?.from || message?.from;
+  // The bot must be a group admin to check members. Ignore group traffic so
+  // ordinary group messages cannot trigger menus or expose personal API keys.
+  if (message?.chat?.type !== 'private' || !from?.id || from.is_bot) return;
+  if (query && typeof query.data !== 'string') return;
+  if (query?.id) {
+    await telegram('answerCallbackQuery', { callback_query_id: query.id }).catch(() => {});
+  }
+  const verification = query?.data.match(/^group_verify(?::(ref_[a-f0-9]{10}))?$/);
+  const startCode = query ? undefined : message.text?.trim().match(/^\/start(?:@\w+)?\s+(ref_[a-f0-9]{10})$/i)?.[1];
+  // Keep the referral in the verification button, so a bot restart while the
+  // user joins does not lose it. Credit the inviter only after membership passes.
+  const referralCode = verification?.[1] || startCode?.toLowerCase() || '';
+  const checks = await requiredGroupMembership(from.id);
+  if (!checks.every(check => check.joined)) {
+    clearPendingInput(from.id);
+    const view = groupJoinView(referralCode, checks);
+    return telegram('sendMessage', {
+      chat_id: message.chat.id, ...view, parse_mode: 'HTML',
+    });
+  }
+  if (verification) {
+    await telegram('editMessageText', {
+      chat_id: message.chat.id, message_id: message.message_id,
+      text: '\u{2705} Keanggotaan terverifikasi! Kamu sudah bisa menggunakan bot.',
+      reply_markup: { inline_keyboard: [] },
+    }).catch(() => {});
+    return handleMessage({ from, chat: message.chat, text: `/start${referralCode ? ` ${referralCode}` : ''}` });
+  }
+  if (query) return handleCallbackQuery({ ...query, id: undefined });
+  return handleMessage(message);
+}
+
 async function poll() {
   try {
     const updates = await telegram('getUpdates', { offset: updateOffset, timeout: 25, allowed_updates: ['message', 'callback_query'] });
     for (const update of updates) {
       updateOffset = update.update_id + 1;
-      if (update.callback_query) await handleCallbackQuery(update.callback_query);
-      else if (update.message) await handleMessage(update.message);
+      await handleBotUpdate(update);
     }
   } catch (error) {
     console.error('[telegram]', error.message);
@@ -5019,6 +5317,18 @@ telegram('deleteWebhook').then(() => telegram('getMe')).then((bot) => {
   botUsername = bot.username || '';
   console.log(`Telegram bot @${bot.username} is running.`);
   console.log(`[data] Using ${dataMode}`);
+  // On split hosting the API sends testimonials; never start another sender
+  // against independent local files on the remote bot host.
+  if (dataMode === 'local files') {
+    require('./payment-testimonials').createPaymentTestimonialWorker({
+      sources: [require('./credit-store'), require('./usage-db')].map(store => ({
+        list: store.listPendingPaymentTestimonials,
+        claim: store.claimPaymentTestimonial,
+        complete: store.completePaymentTestimonial,
+      })),
+    }).start();
+  }
+  checkRequiredGroupAccess(bot);
   // Not awaited: the command menu must never delay or stop the bot (errors are logged inside).
   registerBotCommands();
   // Connectivity check at startup so a wrong DATA_API_URL shows up immediately in the log.
